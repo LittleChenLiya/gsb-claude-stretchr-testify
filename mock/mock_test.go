@@ -2550,3 +2550,326 @@ func TestIssue1227AssertExpectationsForObjectsWithMock(t *testing.T) {
 	AssertExpectationsForObjects(mockT, Mock{})
 	assert.Equal(t, 1, mockT.errorfCount)
 }
+
+/*
+	AwaitExpectations tests
+*/
+
+type awaitTestService struct {
+	Mock
+}
+
+func (s *awaitTestService) Work(name string) {
+	s.Called(name)
+}
+
+// Two concurrent calls are held, one inside its Run callback and one inside
+// WaitUntil. AwaitExpectations must not succeed until both fully complete.
+func TestAwaitExpectationsWaitsForRunAndWaitUntil(t *testing.T) {
+	svc := &awaitTestService{}
+
+	runEntered := make(chan struct{})
+	runRelease := make(chan struct{})
+	waitGate := make(chan time.Time)
+
+	svc.On("Work", "run").Return().Run(func(args Arguments) {
+		close(runEntered)
+		<-runRelease
+	}).Once()
+	svc.On("Work", "wait").Return().WaitUntil(waitGate).Once()
+
+	go svc.Work("run")
+	go svc.Work("wait")
+	<-runEntered
+
+	awaitDone := make(chan []UnsatisfiedExpectation, 1)
+	go func() {
+		awaitDone <- svc.AwaitExpectations(context.Background())
+	}()
+
+	// One call is stuck in Run, the other in WaitUntil: no early success.
+	select {
+	case res := <-awaitDone:
+		t.Fatalf("AwaitExpectations returned while a call was in Run: %v", res)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(runRelease)
+
+	// Run finished, but WaitUntil is still blocking the other call.
+	select {
+	case res := <-awaitDone:
+		t.Fatalf("AwaitExpectations returned while a call was in WaitUntil: %v", res)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(waitGate)
+
+	select {
+	case res := <-awaitDone:
+		require.Nil(t, res)
+	case <-time.After(time.Second):
+		t.Fatal("AwaitExpectations did not return after all calls completed")
+	}
+}
+
+// Cancelling one waiter's context abandons only that waiter; a second waiter
+// keeps waiting and succeeds once the call completes.
+func TestAwaitExpectationsCancelOnlyAffectsThatWaiter(t *testing.T) {
+	svc := &awaitTestService{}
+	svc.On("Work", "go").Return().Once()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelledWaiter := make(chan []UnsatisfiedExpectation, 1)
+	go func() {
+		cancelledWaiter <- svc.AwaitExpectations(ctx)
+	}()
+
+	survivingWaiter := make(chan []UnsatisfiedExpectation, 1)
+	go func() {
+		survivingWaiter <- svc.AwaitExpectations(context.Background())
+	}()
+
+	// Give both waiters a chance to register before cancelling the first one.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case res := <-cancelledWaiter:
+		require.Len(t, res, 1)
+		require.Equal(t, "Work", res[0].Method)
+		require.Equal(t, 0, res[0].CompletedCalls)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled waiter did not return")
+	}
+
+	select {
+	case res := <-survivingWaiter:
+		t.Fatalf("other waiter was affected by cancellation: %v", res)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	svc.Work("go")
+
+	select {
+	case res := <-survivingWaiter:
+		require.Nil(t, res)
+	case <-time.After(time.Second):
+		t.Fatal("surviving waiter did not finish after the call completed")
+	}
+}
+
+// Maybe expectations are optional and never block the wait, whether or not
+// they are ever called.
+func TestAwaitExpectationsMaybe(t *testing.T) {
+	svc := &awaitTestService{}
+	svc.On("Work", "optional").Return().Maybe()
+
+	require.Nil(t, svc.AwaitExpectations(context.Background()))
+
+	svc.Work("optional")
+
+	require.Nil(t, svc.AwaitExpectations(context.Background()))
+}
+
+// Times(n) needs n completed calls; incomplete waits report structured
+// progress and succeed once the count is reached.
+func TestAwaitExpectationsTimes(t *testing.T) {
+	svc := &awaitTestService{}
+	svc.On("Work", "twice").Return().Times(2)
+
+	svc.Work("twice")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelledWaiter := make(chan []UnsatisfiedExpectation, 1)
+	go func() {
+		cancelledWaiter <- svc.AwaitExpectations(ctx)
+	}()
+	cancel()
+
+	select {
+	case res := <-cancelledWaiter:
+		require.Len(t, res, 1)
+		require.Equal(t, "Work", res[0].Method)
+		require.Equal(t, 2, res[0].RequiredCalls)
+		require.Equal(t, 1, res[0].CompletedCalls)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled waiter did not return")
+	}
+
+	svc.Work("twice")
+
+	require.Nil(t, svc.AwaitExpectations(context.Background()))
+}
+
+// NotBefore keeps its call-time ordering semantics; an ordered pair of
+// completed calls satisfies the wait.
+func TestAwaitExpectationsNotBefore(t *testing.T) {
+	svc := &awaitTestService{}
+	initCall := svc.On("Work", "init").Return().Once()
+	svc.On("Work", "main").Return().Once().NotBefore(initCall)
+
+	awaitDone := make(chan []UnsatisfiedExpectation, 1)
+	go func() {
+		awaitDone <- svc.AwaitExpectations(context.Background())
+	}()
+
+	svc.Work("init")
+	svc.Work("main")
+
+	select {
+	case res := <-awaitDone:
+		require.Nil(t, res)
+	case <-time.After(time.Second):
+		t.Fatal("AwaitExpectations did not return after ordered calls")
+	}
+}
+
+// An expectation present in the snapshot that is later removed with Unset no
+// longer blocks the wait, and the wait is woken without polling.
+func TestAwaitExpectationsUnset(t *testing.T) {
+	svc := &awaitTestService{}
+	dropped := svc.On("Work", "dropped").Return()
+
+	awaitDone := make(chan []UnsatisfiedExpectation, 1)
+	go func() {
+		awaitDone <- svc.AwaitExpectations(context.Background())
+	}()
+
+	// Let the waiter snapshot the expectation before removing it.
+	time.Sleep(50 * time.Millisecond)
+	dropped.Unset()
+
+	select {
+	case res := <-awaitDone:
+		require.Nil(t, res)
+	case <-time.After(time.Second):
+		t.Fatal("AwaitExpectations did not return after Unset")
+	}
+}
+
+// A call that panics via Panic or a panicking Run callback never counts as
+// completed, so the expectation stays unsatisfied.
+func TestAwaitExpectationsPanicIsNotSatisfied(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(*awaitTestService)
+		call  func(*awaitTestService)
+	}{
+		{
+			name: "panic message",
+			setup: func(svc *awaitTestService) {
+				svc.On("Work", "boom").Return().Panic("kaboom").Once()
+			},
+			call: func(svc *awaitTestService) {
+				defer func() {
+					if recover() != "kaboom" {
+						t.Fatal("expected kaboom panic")
+					}
+				}()
+				svc.Work("boom")
+			},
+		},
+		{
+			name: "run callback",
+			setup: func(svc *awaitTestService) {
+				svc.On("Work", "runpanic").Return().Run(func(Arguments) {
+					panic("run failed")
+				}).Once()
+			},
+			call: func(svc *awaitTestService) {
+				defer func() {
+					if recover() != "run failed" {
+						t.Fatal("expected run failed panic")
+					}
+				}()
+				svc.Work("runpanic")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &awaitTestService{}
+			tc.setup(svc)
+			tc.call(svc)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancelledWaiter := make(chan []UnsatisfiedExpectation, 1)
+			go func() {
+				cancelledWaiter <- svc.AwaitExpectations(ctx)
+			}()
+			cancel()
+
+			select {
+			case res := <-cancelledWaiter:
+				require.Len(t, res, 1)
+				require.Equal(t, "Work", res[0].Method)
+				require.Equal(t, 0, res[0].CompletedCalls)
+				require.Equal(t, 1, res[0].RequiredCalls)
+			case <-time.After(time.Second):
+				t.Fatal("cancelled waiter did not return")
+			}
+		})
+	}
+}
+
+// Expectations registered after AwaitExpectations starts are not part of the
+// snapshot and must not extend the wait.
+func TestAwaitExpectationsSnapshotIgnoresLaterExpectations(t *testing.T) {
+	svc := &awaitTestService{}
+	svc.On("Work", "early").Return().Once()
+
+	awaitDone := make(chan []UnsatisfiedExpectation, 1)
+	go func() {
+		awaitDone <- svc.AwaitExpectations(context.Background())
+	}()
+
+	// Let the waiter take its snapshot, then register a never-called
+	// expectation that must not extend this wait.
+	time.Sleep(50 * time.Millisecond)
+	svc.On("Work", "late").Return().Once()
+
+	svc.Work("early")
+
+	select {
+	case res := <-awaitDone:
+		require.Nil(t, res)
+	case <-time.After(time.Second):
+		t.Fatal("AwaitExpectations was extended by an expectation added later")
+	}
+}
+
+func ExampleMock_AwaitExpectations() {
+	svc := &awaitTestService{}
+	svc.On("Work", "job").Return().Once()
+
+	awaitDone := make(chan []UnsatisfiedExpectation, 1)
+	go func() {
+		awaitDone <- svc.AwaitExpectations(context.Background())
+	}()
+
+	fmt.Println("calling work")
+	svc.Work("job")
+	fmt.Println("work completed")
+	fmt.Printf("wait result: %v\n", <-awaitDone)
+
+	// With the snapshot already satisfied, a new wait returns immediately.
+	fmt.Printf("unsatisfied: %v\n", svc.AwaitExpectations(context.Background()))
+
+	// Cancelling a wait returns the expectations still unmet.
+	other := &awaitTestService{}
+	other.On("Work", "missing").Return().Once()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, unmet := range other.AwaitExpectations(ctx) {
+		fmt.Printf("unmet: %s\n", unmet)
+	}
+
+	// Output:
+	// calling work
+	// work completed
+	// wait result: []
+	// unsatisfied: []
+	// unmet: Work(string): 0 of 1 required call(s) completed
+}

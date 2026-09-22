@@ -1,6 +1,7 @@
 package mock
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path"
@@ -56,6 +57,12 @@ type Call struct {
 
 	// Amount of times this call has been called
 	totalCalls int
+
+	// Amount of times this call has fully completed, i.e. returned from
+	// MethodCalled without panicking. A call that is still blocked in
+	// WaitUntil/After, still running its Run callback, or that panicked is
+	// not counted here.
+	completedCalls int
 
 	// Call to this method can be optional
 	optional bool
@@ -249,6 +256,10 @@ func (c *Call) Unset() *Call {
 	// trim slice up to last copied index
 	c.Parent.ExpectedCalls = c.Parent.ExpectedCalls[:index]
 
+	// Wake AwaitExpectations waiters: expectations removed from the
+	// registry no longer block a snapshot wait.
+	c.Parent.broadcastAwait()
+
 	if !foundMatchingCall {
 		unlockOnce.Do(c.unlock)
 		c.Parent.fail("\n\nmock: Could not find expected call\n-----------------------------\n\n%s\n\n",
@@ -314,6 +325,11 @@ type Mock struct {
 	testData objx.Map
 
 	mutex sync.Mutex
+
+	// awaitNotify, when non-nil, is closed to broadcast a change relevant to
+	// AwaitExpectations waiters (a call completed, or an expectation was
+	// removed via Unset). Guarded by mutex; replaced after every broadcast.
+	awaitNotify chan struct{}
 }
 
 // String provides a %v format string for Mock.
@@ -580,10 +596,164 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 	}
 
 	m.mutex.Lock()
+	call.completedCalls++
+	m.broadcastAwait()
 	returnArgs := call.ReturnArguments
 	m.mutex.Unlock()
 
 	return returnArgs
+}
+
+/*
+	Awaiting expectations
+*/
+
+// UnsatisfiedExpectation describes a single expectation that had not been
+// satisfied when [Mock.AwaitExpectations] returned.
+type UnsatisfiedExpectation struct {
+	// Method is the name of the method that was expected to be called.
+	Method string
+
+	// Arguments are the arguments the method was expected to be called with.
+	Arguments Arguments
+
+	// RequiredCalls is the number of completed calls the expectation needs
+	// in order to be satisfied.
+	RequiredCalls int
+
+	// CompletedCalls is the number of calls that had fully completed (i.e.
+	// returned from the mocked method without panicking) at the time
+	// AwaitExpectations returned.
+	CompletedCalls int
+}
+
+// String provides a human-readable description of the unmet expectation.
+func (u UnsatisfiedExpectation) String() string {
+	return fmt.Sprintf("%s(%s): %d of %d required call(s) completed",
+		u.Method, u.Arguments.String(), u.CompletedCalls, u.RequiredCalls)
+}
+
+// awaitedExpectation is one expectation captured in an AwaitExpectations
+// snapshot, together with the number of completed calls it needs.
+type awaitedExpectation struct {
+	call     *Call
+	required int
+}
+
+// AwaitExpectations blocks until every expectation registered at the moment
+// it is called has been satisfied, or until ctx is done. It returns nil once
+// all of those expectations are satisfied; otherwise it returns the
+// expectations that are still unmet, including when ctx is cancelled.
+//
+// The wait covers a snapshot of the expectations registered when
+// AwaitExpectations is entered; expectations added later (via [Mock.On])
+// neither extend nor shorten this wait. An expectation that is removed from
+// the registry via [Call.Unset] while waiting is dropped from the snapshot
+// and no longer blocks the wait.
+//
+// An expectation is satisfied when it has fully completed the required
+// number of calls: expectations bounded with [Call.Once] or [Call.Times]
+// need exactly that many completions, and unbounded expectations need at
+// least one. A call only counts as completed once the mocked method has
+// returned: a call still blocked in [Call.WaitUntil]/[Call.After] or still
+// running its [Call.Run] callback does not count, and a call that panics
+// (via [Call.Panic] or a panicking Run callback) never counts. Expectations
+// marked with [Call.Maybe] are optional and never block the wait.
+//
+// Cancellation of ctx only abandons this particular wait: in-flight mocked
+// calls are not interrupted and other concurrent waiters are unaffected.
+func (m *Mock) AwaitExpectations(ctx context.Context) []UnsatisfiedExpectation {
+	m.mutex.Lock()
+	snapshot := make([]awaitedExpectation, 0, len(m.ExpectedCalls))
+	for _, call := range m.ExpectedCalls {
+		required := call.totalCalls
+		switch {
+		case call.Repeatability > 0:
+			// Once/Times: the remaining repeats still have to happen.
+			required += call.Repeatability
+		case call.Repeatability == 0 && required == 0:
+			// Unbounded expectation: at least one call.
+			required = 1
+		}
+		snapshot = append(snapshot, awaitedExpectation{call: call, required: required})
+	}
+	m.mutex.Unlock()
+
+	for {
+		m.mutex.Lock()
+		unsatisfied := m.unsatisfiedExpectations(snapshot)
+		if len(unsatisfied) == 0 {
+			m.mutex.Unlock()
+			return nil
+		}
+		notify := m.awaitSignal()
+		m.mutex.Unlock()
+
+		select {
+		case <-ctx.Done():
+			m.mutex.Lock()
+			defer m.mutex.Unlock()
+			return m.unsatisfiedExpectations(snapshot)
+		case <-notify:
+		}
+	}
+}
+
+// awaitSignal returns the channel the next broadcast will close.
+// Callers must hold m.mutex.
+func (m *Mock) awaitSignal() chan struct{} {
+	if m.awaitNotify == nil {
+		m.awaitNotify = make(chan struct{})
+	}
+	return m.awaitNotify
+}
+
+// broadcastAwait wakes all current AwaitExpectations waiters so they can
+// re-evaluate their snapshot. Callers must hold m.mutex. No user matchers
+// or callbacks run here, so holding the lock cannot re-enter user code.
+func (m *Mock) broadcastAwait() {
+	if m.awaitNotify != nil {
+		close(m.awaitNotify)
+		m.awaitNotify = nil
+	}
+}
+
+// unsatisfiedExpectations evaluates a snapshot against the current state.
+// Callers must hold m.mutex. It performs no argument matching, so no user
+// matcher code runs under the lock.
+func (m *Mock) unsatisfiedExpectations(snapshot []awaitedExpectation) []UnsatisfiedExpectation {
+	var unsatisfied []UnsatisfiedExpectation
+	for _, awaited := range snapshot {
+		call := awaited.call
+		if call.optional {
+			continue
+		}
+		if !m.expectationRegistered(call) {
+			// Removed via Unset after the snapshot was taken.
+			continue
+		}
+		if call.completedCalls >= awaited.required {
+			continue
+		}
+		unsatisfied = append(unsatisfied, UnsatisfiedExpectation{
+			Method:         call.Method,
+			Arguments:      call.Arguments,
+			RequiredCalls:  awaited.required,
+			CompletedCalls: call.completedCalls,
+		})
+	}
+	return unsatisfied
+}
+
+// expectationRegistered reports whether call is still in the expectation
+// registry. Callers must hold m.mutex.
+func (m *Mock) expectationRegistered(call *Call) bool {
+	for _, expected := range m.ExpectedCalls {
+		if expected == call {
+			return true
+		}
+	}
+	return false
 }
 
 /*
