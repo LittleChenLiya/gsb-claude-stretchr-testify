@@ -2550,3 +2550,264 @@ func TestIssue1227AssertExpectationsForObjectsWithMock(t *testing.T) {
 	AssertExpectationsForObjects(mockT, Mock{})
 	assert.Equal(t, 1, mockT.errorfCount)
 }
+
+func TestAwaitExpectationsWaitsForRunAndWaitUntil(t *testing.T) {
+	var m Mock
+	runEntered := make(chan struct{})
+	releaseRun := make(chan struct{})
+	waitGate := make(chan time.Time)
+
+	m.On("WithRun").Return().Run(func(Arguments) {
+		close(runEntered)
+		<-releaseRun
+	}).Once()
+	m.On("WithWait").Return().WaitUntil(waitGate).Once()
+
+	go func() { m.MethodCalled("WithRun") }()
+	go func() { m.MethodCalled("WithWait") }()
+
+	// The Run callback has started, so the call is counted but not complete.
+	<-runEntered
+
+	awaitDone := make(chan error, 1)
+	go func() { awaitDone <- m.AwaitExpectations(context.Background()) }()
+
+	select {
+	case err := <-awaitDone:
+		t.Fatalf("AwaitExpectations returned before Run/WaitUntil finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseRun)
+	close(waitGate)
+
+	select {
+	case err := <-awaitDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("AwaitExpectations did not return after all calls completed")
+	}
+	m.AssertExpectations(t)
+}
+
+func TestAwaitExpectationsCancelOneWaiter(t *testing.T) {
+	var m Mock
+	m.On("Work").Return().Once()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	canceledDone := make(chan error, 1)
+	go func() { canceledDone <- m.AwaitExpectations(ctx) }()
+	survivorDone := make(chan error, 1)
+	go func() { survivorDone <- m.AwaitExpectations(context.Background()) }()
+
+	cancel()
+	select {
+	case err := <-canceledDone:
+		var awaitErr *AwaitExpectationsError
+		require.ErrorAs(t, err, &awaitErr)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Len(t, awaitErr.Unsatisfied, 1)
+		assert.Equal(t, "Work", awaitErr.Unsatisfied[0].Method)
+		assert.Equal(t, 1, awaitErr.Unsatisfied[0].RemainingCalls)
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled waiter did not return")
+	}
+
+	// The surviving waiter must not be affected by the cancellation.
+	select {
+	case err := <-survivorDone:
+		t.Fatalf("surviving waiter returned early: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	m.MethodCalled("Work")
+	select {
+	case err := <-survivorDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("surviving waiter did not return after the call completed")
+	}
+}
+
+func TestAwaitExpectationsMaybe(t *testing.T) {
+	var m Mock
+	m.On("Optional").Return().Maybe()
+	require.NoError(t, m.AwaitExpectations(context.Background()))
+}
+
+func TestAwaitExpectationsTimes(t *testing.T) {
+	var m Mock
+	m.On("Work").Return().Times(2)
+
+	awaitDone := make(chan error, 1)
+	go func() { awaitDone <- m.AwaitExpectations(context.Background()) }()
+
+	m.MethodCalled("Work")
+	select {
+	case err := <-awaitDone:
+		t.Fatalf("AwaitExpectations returned after 1 of 2 calls: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	m.MethodCalled("Work")
+	select {
+	case err := <-awaitDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("AwaitExpectations did not return after all required calls")
+	}
+}
+
+func TestAwaitExpectationsNotBefore(t *testing.T) {
+	var m Mock
+	m.On("Init").Return().Once()
+	m.On("Do").Return().Once().NotBefore(m.ExpectedCalls[0])
+
+	awaitDone := make(chan error, 1)
+	go func() { awaitDone <- m.AwaitExpectations(context.Background()) }()
+
+	m.MethodCalled("Init")
+	select {
+	case err := <-awaitDone:
+		t.Fatalf("AwaitExpectations returned before the NotBefore chain completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	m.MethodCalled("Do")
+	select {
+	case err := <-awaitDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("AwaitExpectations did not return after the NotBefore chain completed")
+	}
+	m.AssertExpectations(t)
+}
+
+func TestAwaitExpectationsUnset(t *testing.T) {
+	var m Mock
+	m.On("Gone").Return().Once()
+	m.On("Stay").Return().Once()
+
+	awaitDone := make(chan error, 1)
+	go func() { awaitDone <- m.AwaitExpectations(context.Background()) }()
+	// Give the waiter a moment to take its snapshot before unsetting.
+	time.Sleep(100 * time.Millisecond)
+
+	// Unsetting retracts the expectation from the in-flight snapshot.
+	m.On("Gone").Unset()
+
+	m.MethodCalled("Stay")
+	select {
+	case err := <-awaitDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("AwaitExpectations still blocked on an unset expectation")
+	}
+	m.AssertExpectations(t)
+}
+
+func TestAwaitExpectationsIgnoresLaterExpectations(t *testing.T) {
+	var m Mock
+	m.On("First").Return().Once()
+
+	awaitDone := make(chan error, 1)
+	go func() { awaitDone <- m.AwaitExpectations(context.Background()) }()
+	// Give the waiter a moment to take its snapshot before registering more.
+	time.Sleep(100 * time.Millisecond)
+	m.On("Late").Return().Once()
+
+	m.MethodCalled("First")
+	select {
+	case err := <-awaitDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("AwaitExpectations was extended by an expectation registered after the wait started")
+	}
+}
+
+func TestAwaitExpectationsPanicNotSatisfied(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*Mock)
+	}{
+		{"PanicMsg", func(m *Mock) { m.On("Boom").Return().Panic("kaboom").Once() }},
+		{"RunPanic", func(m *Mock) {
+			m.On("Boom").Return().Run(func(Arguments) { panic("callback boom") }).Once()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var m Mock
+			tc.setup(&m)
+
+			callDone := make(chan struct{})
+			go func() {
+				defer func() {
+					require.NotNil(t, recover())
+					close(callDone)
+				}()
+				m.MethodCalled("Boom")
+			}()
+			<-callDone
+
+			// A panicking call never counts as completed, so the wait ends
+			// only with the context and reports the expectation.
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			err := m.AwaitExpectations(ctx)
+			var awaitErr *AwaitExpectationsError
+			require.ErrorAs(t, err, &awaitErr)
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			require.Len(t, awaitErr.Unsatisfied, 1)
+			assert.Equal(t, "Boom", awaitErr.Unsatisfied[0].Method)
+			assert.Equal(t, 1, awaitErr.Unsatisfied[0].RemainingCalls)
+		})
+	}
+}
+
+func ExampleMock_AwaitExpectations() {
+	var m Mock
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	m.On("Work").Return().Run(func(Arguments) {
+		fmt.Println("call started: Work")
+		close(started)
+		<-finish
+		fmt.Println("call completed: Work")
+	}).Once()
+
+	go func() { m.MethodCalled("Work") }()
+	<-started
+
+	awaitDone := make(chan error, 1)
+	go func() { awaitDone <- m.AwaitExpectations(context.Background()) }()
+
+	// The Run callback is still blocked, so the wait does not end yet.
+	select {
+	case err := <-awaitDone:
+		fmt.Println("unexpected early return:", err)
+	case <-time.After(100 * time.Millisecond):
+		fmt.Println("await still waiting while Run is blocked")
+	}
+
+	close(finish)
+	fmt.Println("await result:", <-awaitDone)
+
+	// An expectation that is never satisfied is reported when ctx ends.
+	m.On("Never").Return().Once()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := m.AwaitExpectations(ctx)
+	var awaitErr *AwaitExpectationsError
+	if errors.As(err, &awaitErr) {
+		for _, u := range awaitErr.Unsatisfied {
+			fmt.Printf("unsatisfied: %s remaining=%d\n", u.Method, u.RemainingCalls)
+		}
+	}
+
+	// Output:
+	// call started: Work
+	// await still waiting while Run is blocked
+	// call completed: Work
+	// await result: <nil>
+	// unsatisfied: Never remaining=1
+}

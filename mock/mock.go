@@ -1,6 +1,7 @@
 package mock
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path"
@@ -56,6 +57,10 @@ type Call struct {
 
 	// Amount of times this call has been called
 	totalCalls int
+
+	// completedCalls counts calls that ran to completion: WaitUntil/After
+	// released and the Run callback returned without panicking.
+	completedCalls int
 
 	// Call to this method can be optional
 	optional bool
@@ -249,6 +254,10 @@ func (c *Call) Unset() *Call {
 	// trim slice up to last copied index
 	c.Parent.ExpectedCalls = c.Parent.ExpectedCalls[:index]
 
+	// Wake AwaitExpectations waiters: expectations removed from a snapshot
+	// are treated as retracted and no longer block the wait.
+	c.Parent.notifyAwaiters()
+
 	if !foundMatchingCall {
 		unlockOnce.Do(c.unlock)
 		c.Parent.fail("\n\nmock: Could not find expected call\n-----------------------------\n\n%s\n\n",
@@ -314,6 +323,14 @@ type Mock struct {
 	testData objx.Map
 
 	mutex sync.Mutex
+
+	// awaitMu guards awaitCh. It is a leaf lock: no other lock is acquired
+	// while holding it, and no user matcher or callback runs under it.
+	awaitMu sync.Mutex
+	// awaitCh is closed and replaced every time a call completes or an
+	// expectation is unset, waking AwaitExpectations waiters so they can
+	// re-evaluate their snapshot. Lazily created by awaitSignal.
+	awaitCh chan struct{}
 }
 
 // String provides a %v format string for Mock.
@@ -580,10 +597,162 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 	}
 
 	m.mutex.Lock()
+	call.completedCalls++
 	returnArgs := call.ReturnArguments
 	m.mutex.Unlock()
+	m.notifyAwaiters()
 
 	return returnArgs
+}
+
+// awaitSignal returns the channel that is closed the next time a call
+// completes or an expectation is unset.
+func (m *Mock) awaitSignal() <-chan struct{} {
+	m.awaitMu.Lock()
+	defer m.awaitMu.Unlock()
+	if m.awaitCh == nil {
+		m.awaitCh = make(chan struct{})
+	}
+	return m.awaitCh
+}
+
+// notifyAwaiters wakes all current AwaitExpectations waiters. It never runs
+// user matchers or callbacks and never takes m.mutex, so it is safe to call
+// from anywhere, including while m.mutex is held.
+func (m *Mock) notifyAwaiters() {
+	m.awaitMu.Lock()
+	defer m.awaitMu.Unlock()
+	if m.awaitCh != nil {
+		close(m.awaitCh)
+		m.awaitCh = make(chan struct{})
+	}
+}
+
+// UnsatisfiedExpectation describes a single expectation that had not been
+// satisfied when [Mock.AwaitExpectations] returned.
+type UnsatisfiedExpectation struct {
+	// Method is the name of the expected method.
+	Method string
+	// Arguments are the expected arguments.
+	Arguments Arguments
+	// RemainingCalls is the number of additional completed calls required
+	// to satisfy the expectation.
+	RemainingCalls int
+	// Reason is a human-readable description in the same style as
+	// [Mock.AssertExpectations] failure output.
+	Reason string
+}
+
+// AwaitExpectationsError is returned by [Mock.AwaitExpectations] when the
+// context is canceled before all expectations in the snapshot are satisfied.
+type AwaitExpectationsError struct {
+	// Err is the context error that ended the wait (context.Canceled or
+	// context.DeadlineExceeded).
+	Err error
+	// Unsatisfied lists the expectations from the snapshot that were still
+	// unsatisfied when the wait ended.
+	Unsatisfied []UnsatisfiedExpectation
+}
+
+func (e *AwaitExpectationsError) Error() string {
+	return fmt.Sprintf("mock: AwaitExpectations: %v: %d expectation(s) still unsatisfied", e.Err, len(e.Unsatisfied))
+}
+
+// Unwrap returns the context error that ended the wait.
+func (e *AwaitExpectationsError) Unwrap() error { return e.Err }
+
+// AwaitExpectations blocks until every expectation registered at the moment
+// of the call has been satisfied, or until ctx is canceled. It takes a
+// snapshot of the current expectations on entry: expectations added later do
+// not extend this wait, and expectations removed with [Call.Unset] are
+// treated as retracted and no longer block the wait.
+//
+// An expectation counts as satisfied only when its calls have fully
+// completed: WaitUntil/After released and the Run callback returned. A call
+// whose Run callback panics, or which panics via [Call.Panic], never counts
+// as completed. Once/Times expectations require the configured number of
+// completed calls, Maybe expectations are always satisfied, and expectations
+// without a call limit require at least one completed call. NotBefore keeps
+// its existing meaning and is enforced when the calls are made.
+//
+// Canceling ctx only ends this waiter; in-flight business calls and other
+// waiters are unaffected. AwaitExpectations returns nil once all snapshot
+// expectations are satisfied, otherwise an *AwaitExpectationsError
+// describing the unsatisfied expectations.
+func (m *Mock) AwaitExpectations(ctx context.Context) error {
+	m.mutex.Lock()
+	snapshot := m.expectedCalls()
+	m.mutex.Unlock()
+
+	for {
+		// Grab the signal channel before evaluating, so a completion that
+		// lands between the check and the wait closes this channel and
+		// triggers an immediate re-evaluation instead of being missed.
+		signal := m.awaitSignal()
+		unsatisfied := m.unsatisfiedExpectations(snapshot)
+		if len(unsatisfied) == 0 {
+			return nil
+		}
+		select {
+		case <-signal:
+		case <-ctx.Done():
+			return &AwaitExpectationsError{
+				Err:         ctx.Err(),
+				Unsatisfied: m.unsatisfiedExpectations(snapshot),
+			}
+		}
+	}
+}
+
+// unsatisfiedExpectations reports which expectations from the snapshot are
+// still unsatisfied. Expectations that have been unset since the snapshot
+// was taken are treated as retracted and skipped.
+func (m *Mock) unsatisfiedExpectations(snapshot []*Call) []UnsatisfiedExpectation {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	var unsatisfied []UnsatisfiedExpectation
+	for _, call := range snapshot {
+		if !m.expectationRegistered(call) {
+			continue
+		}
+		if call.optional {
+			continue
+		}
+		// Repeatability and totalCalls together encode how many calls a
+		// Times/Once expectation requires: each call decrements
+		// Repeatability (to -1 when exhausted) and increments totalCalls.
+		required := call.totalCalls
+		if call.Repeatability > 0 {
+			required += call.Repeatability
+		}
+		if required == 0 {
+			// No call limit: at least one completed call is required.
+			required = 1
+		}
+		remaining := required - call.completedCalls
+		if remaining <= 0 {
+			continue
+		}
+		unsatisfied = append(unsatisfied, UnsatisfiedExpectation{
+			Method:         call.Method,
+			Arguments:      call.Arguments,
+			RemainingCalls: remaining,
+			Reason:         fmt.Sprintf("FAIL:\t%s(%s)\n\t\tat: %s", call.Method, call.Arguments.String(), call.callerInfo),
+		})
+	}
+	return unsatisfied
+}
+
+// expectationRegistered reports whether call is still in ExpectedCalls.
+// The caller must hold m.mutex.
+func (m *Mock) expectationRegistered(call *Call) bool {
+	for _, c := range m.ExpectedCalls {
+		if c == call {
+			return true
+		}
+	}
+	return false
 }
 
 /*
