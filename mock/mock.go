@@ -78,6 +78,9 @@ type Call struct {
 
 	// Calls which must be satisfied before this call can be
 	requires []*Call
+
+	// branch is the branch group branch this call belongs to, if any.
+	branch *Branch
 }
 
 func newCall(parent *Mock, methodName string, callerInfo []string, methodArguments Arguments, returnArguments Arguments) *Call {
@@ -294,6 +297,261 @@ func InOrder(calls ...*Call) {
 	}
 }
 
+/*
+	Branch groups (mutually exclusive expectation branches)
+*/
+
+// BranchGroup declares a set of mutually exclusive expectation branches on a
+// Mock. Each branch holds an ordered sequence of Call expectations. All
+// branches start unselected: the first incoming call that matches the first
+// Call of a branch atomically selects that branch, and subsequent calls may
+// only consume expectations from the selected branch. Calls that would match
+// another branch after selection fail as unexpected and never switch the
+// selection.
+//
+// If a single call matches the first Call of more than one branch, the call
+// fails with an explicit ambiguity error instead of guessing by registration
+// order.
+//
+// AssertExpectations only checks the remaining expectations of the selected
+// branch; unselected branches are ignored. A group in which no branch was
+// ever selected fails AssertExpectations unless it was marked Optional.
+type BranchGroup struct {
+	parent   *Mock
+	index    int
+	branches []*Branch
+	selected *Branch
+	optional bool
+}
+
+// Branch is one mutually exclusive branch of a BranchGroup. It holds an
+// ordered sequence of Call expectations which are consumed from the head as
+// matching calls arrive.
+type Branch struct {
+	group *BranchGroup
+	index int
+	calls []*Call
+	head  int
+}
+
+// BranchGroup creates a new group of mutually exclusive expectation branches
+// on the mock. Expectations registered through the group's branches do not
+// interfere with expectations registered directly through Mock.On.
+func (m *Mock) BranchGroup() *BranchGroup {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	group := &BranchGroup{parent: m, index: len(m.branchGroups)}
+	m.branchGroups = append(m.branchGroups, group)
+	return group
+}
+
+// Branch adds a new branch to the group. It panics if the previously added
+// branch is still empty, because empty branches are rejected.
+func (g *BranchGroup) Branch() *Branch {
+	g.parent.mutex.Lock()
+	defer g.parent.mutex.Unlock()
+
+	if n := len(g.branches); n > 0 && len(g.branches[n-1].calls) == 0 {
+		panic(fmt.Sprintf("mock: cannot add branch %d to branch group %d: branch %d is empty", len(g.branches), g.index, n-1))
+	}
+	branch := &Branch{group: g, index: len(g.branches)}
+	g.branches = append(g.branches, branch)
+	return branch
+}
+
+// Optional marks the whole group as optional: AssertExpectations will not
+// fail if no branch of the group was ever selected.
+func (g *BranchGroup) Optional() *BranchGroup {
+	g.parent.mutex.Lock()
+	defer g.parent.mutex.Unlock()
+	g.optional = true
+	return g
+}
+
+// Selected returns the index of the selected branch, or -1 if no branch has
+// been selected yet.
+func (g *BranchGroup) Selected() int {
+	g.parent.mutex.Lock()
+	defer g.parent.mutex.Unlock()
+	if g.selected == nil {
+		return -1
+	}
+	return g.selected.index
+}
+
+// UnmetExpectations describes the expectations that still need to be
+// satisfied. If a branch was selected, it lists the remaining calls of that
+// branch; otherwise it lists the first call of every candidate branch.
+func (g *BranchGroup) UnmetExpectations() []string {
+	g.parent.mutex.Lock()
+	defer g.parent.mutex.Unlock()
+
+	var unmet []string
+	if g.selected != nil {
+		for i := g.selected.head; i < len(g.selected.calls); i++ {
+			c := g.selected.calls[i]
+			if c.optional || (c.totalCalls > 0 && c.Repeatability <= 0) {
+				continue
+			}
+			unmet = append(unmet, callString(c.Method, c.Arguments, false))
+		}
+		return unmet
+	}
+	for _, branch := range g.branches {
+		if head := branch.headCall(); head != nil {
+			unmet = append(unmet, callString(head.Method, head.Arguments, false))
+		}
+	}
+	return unmet
+}
+
+// On starts a description of the next expectation of the branch. Calls
+// within a branch are consumed in the order they are registered: each call
+// satisfies the head expectation exactly once, unless Call.Times (or
+// Call.Once) requests a specific repeat count.
+func (b *Branch) On(methodName string, arguments ...interface{}) *Call {
+	for _, arg := range arguments {
+		if v := reflect.ValueOf(arg); v.Kind() == reflect.Func {
+			panic(fmt.Sprintf("cannot use Func in expectations. Use mock.AnythingOfType(\"%T\")", arg))
+		}
+	}
+
+	m := b.group.parent
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	c := newCall(m, methodName, assert.CallerInfo(), arguments, make([]interface{}, 0))
+	c.branch = b
+	b.calls = append(b.calls, c)
+	return c
+}
+
+// headCall returns the next unconsumed call of the branch, or nil if the
+// branch has been fully consumed.
+func (b *Branch) headCall() *Call {
+	if b.head >= len(b.calls) {
+		return nil
+	}
+	return b.calls[b.head]
+}
+
+// validate checks the structural invariants of the group. It returns a
+// non-empty string describing the first problem found.
+func (g *BranchGroup) validate() string {
+	owned := make(map[*Call]int)
+	for _, branch := range g.branches {
+		if len(branch.calls) == 0 {
+			return fmt.Sprintf("branch %d is empty", branch.index)
+		}
+		for _, c := range branch.calls {
+			if first, dup := owned[c]; dup {
+				return fmt.Sprintf("call %s is registered in both branch %d and branch %d",
+					callString(c.Method, c.Arguments, false), first, branch.index)
+			}
+			owned[c] = branch.index
+		}
+	}
+	for c := range owned {
+		if hasNotBeforeCycle(c) {
+			return fmt.Sprintf("circular NotBefore dependency involving call %s",
+				callString(c.Method, c.Arguments, false))
+		}
+	}
+	return ""
+}
+
+// hasNotBeforeCycle reports whether start is reachable from itself through
+// NotBefore requirements (possibly via calls outside any branch group).
+func hasNotBeforeCycle(start *Call) bool {
+	visited := make(map[*Call]bool)
+	var visit func(c *Call) bool
+	visit = func(c *Call) bool {
+		for _, req := range c.requires {
+			if req == start {
+				return true
+			}
+			if !visited[req] {
+				visited[req] = true
+				if visit(req) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return visit(start)
+}
+
+// validateBranchGroups returns a non-empty string if any branch group is
+// structurally invalid. The caller must hold m.mutex.
+func (m *Mock) validateBranchGroups() string {
+	for _, group := range m.branchGroups {
+		if problem := group.validate(); problem != "" {
+			return fmt.Sprintf("mock: invalid branch group %d: %s", group.index, problem)
+		}
+	}
+	return ""
+}
+
+// matchBranchCall finds the branch head call matching the given method call.
+// It returns the matching call and branch when exactly one branch head
+// matches. When more than one branch head matches, it returns all matching
+// branches so the caller can report an ambiguity error. The caller must hold
+// m.mutex.
+func (m *Mock) matchBranchCall(method string, arguments ...interface{}) (*Call, *Branch, []*Branch) {
+	var matches []*Branch
+	var matched *Call
+	for _, group := range m.branchGroups {
+		branches := group.branches
+		if group.selected != nil {
+			branches = []*Branch{group.selected}
+		}
+		for _, branch := range branches {
+			head := branch.headCall()
+			if head == nil || head.Method != method {
+				continue
+			}
+			if _, diffCount := head.Arguments.Diff(arguments); diffCount == 0 {
+				matches = append(matches, branch)
+				matched = head
+			}
+		}
+	}
+	if len(matches) != 1 {
+		return nil, nil, matches
+	}
+	return matched, matches[0], matches
+}
+
+// branchDiagnostics describes the candidate branch head calls, for inclusion
+// in unexpected-call failure messages. The caller must hold m.mutex.
+func (m *Mock) branchDiagnostics() string {
+	if len(m.branchGroups) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\nBranch group candidate call(s):")
+	for _, group := range m.branchGroups {
+		if group.selected != nil {
+			next := "(branch fully consumed)"
+			if head := group.selected.headCall(); head != nil {
+				next = callString(head.Method, head.Arguments, true)
+			}
+			fmt.Fprintf(&sb, "\n\tgroup %d: branch %d is selected; next expected call: %s",
+				group.index, group.selected.index, next)
+			continue
+		}
+		for _, branch := range group.branches {
+			if head := branch.headCall(); head != nil {
+				fmt.Fprintf(&sb, "\n\tgroup %d branch %d first call: %s",
+					group.index, branch.index, callString(head.Method, head.Arguments, true))
+			}
+		}
+	}
+	return sb.String()
+}
+
 // Mock is the workhorse used to track activity on another object.
 // For an example of its usage, refer to the "Example Usage" section at the top
 // of this document.
@@ -312,6 +570,10 @@ type Mock struct {
 	// TestData holds any data that might be useful for testing.  Testify ignores
 	// this data completely allowing you to do whatever you like with it.
 	testData objx.Map
+
+	// branchGroups holds the mutually exclusive expectation branch groups
+	// registered through BranchGroup().
+	branchGroups []*BranchGroup
 
 	mutex sync.Mutex
 }
@@ -497,14 +759,77 @@ func (m *Mock) Called(arguments ...interface{}) Arguments {
 // If Call.WaitFor is set, blocks until the channel is closed or receives a message.
 func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Arguments {
 	m.mutex.Lock()
+	if problem := m.validateBranchGroups(); problem != "" {
+		m.mutex.Unlock()
+		panic(problem)
+	}
+	if len(m.branchGroups) > 0 {
+		call, branch, matches := m.matchBranchCall(methodName, arguments...)
+		if len(matches) > 1 {
+			var sb strings.Builder
+			for _, b := range matches {
+				head := b.headCall()
+				fmt.Fprintf(&sb, "\n\tgroup %d branch %d: %s",
+					b.group.index, b.index, callString(head.Method, head.Arguments, true))
+			}
+			m.mutex.Unlock()
+			m.fail("\n\nmock: Ambiguous Method Call\n-----------------------------\n\n%s\n\nThe call matches the next expected call of more than one branch:%s\nat: %s\n",
+				callString(methodName, arguments, true),
+				sb.String(),
+				assert.CallerInfo(),
+			)
+			return nil
+		}
+		if call != nil {
+			for _, requirement := range call.requires {
+				if satisfied, _ := requirement.Parent.checkExpectation(requirement); !satisfied {
+					m.mutex.Unlock()
+					m.fail("mock: Unexpected Method Call\n-----------------------------\n\n%s\n\nMust not be called before%s:\n\n%s",
+						callString(call.Method, call.Arguments, true),
+						func() (s string) {
+							if requirement.totalCalls > 0 {
+								s = " another call of"
+							}
+							if call.Parent != requirement.Parent {
+								s += " method from another mock instance"
+							}
+							return
+						}(),
+						callString(requirement.Method, requirement.Arguments, true),
+					)
+					return nil
+				}
+			}
+
+			// Atomically select the branch (if not already selected) and
+			// consume its head expectation.
+			if branch.group.selected == nil {
+				branch.group.selected = branch
+			}
+			call.totalCalls++
+			if call.Repeatability > 1 {
+				call.Repeatability--
+			} else {
+				call.Repeatability = -1
+				branch.head++
+			}
+
+			// add the call
+			m.Calls = append(m.Calls, *newCall(m, methodName, assert.CallerInfo(), arguments, call.ReturnArguments))
+			m.mutex.Unlock()
+
+			return m.runCall(call, arguments)
+		}
+	}
 	// TODO: could combine expected and closes in single loop
 	found, call := m.findExpectedCall(methodName, arguments...)
 
 	if found < 0 {
+		branchInfo := m.branchDiagnostics()
 		// expected call found, but it has already been called with repeatable times
 		if call != nil {
 			m.mutex.Unlock()
-			m.fail("\nassert: mock: The method has been called over %d times.\n\tEither do one more Mock.On(%#v).Return(...), or remove extra call.\n\tThis call was unexpected:\n\t\t%s\n\tat: %s", call.totalCalls, methodName, callString(methodName, arguments, true), assert.CallerInfo())
+			m.fail("\nassert: mock: The method has been called over %d times.\n\tEither do one more Mock.On(%#v).Return(...), or remove extra call.\n\tThis call was unexpected:\n\t\t%s%s\n\tat: %s", call.totalCalls, methodName, callString(methodName, arguments, true), branchInfo, assert.CallerInfo())
 		}
 		// we have to fail here - because we don't know what to do
 		// as the return arguments.  This is because:
@@ -515,15 +840,16 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 		m.mutex.Unlock()
 
 		if closestCall != nil {
-			m.fail("\n\nmock: Unexpected Method Call\n-----------------------------\n\n%s\n\nThe closest call I have is: \n\n%s\n\n%s\nDiff: %s\nat: %s\n",
+			m.fail("\n\nmock: Unexpected Method Call\n-----------------------------\n\n%s\n\nThe closest call I have is: \n\n%s\n\n%s\nDiff: %s%s\nat: %s\n",
 				callString(methodName, arguments, true),
 				callString(methodName, closestCall.Arguments, true),
 				diffArguments(closestCall.Arguments, arguments),
 				strings.TrimSpace(mismatch),
+				branchInfo,
 				assert.CallerInfo(),
 			)
 		} else {
-			m.fail("\nassert: mock: I don't know what to return because the method call was unexpected.\n\tEither do Mock.On(%#v).Return(...) first, or remove the %s() call.\n\tThis method was unexpected:\n\t\t%s\n\tat: %s", methodName, methodName, callString(methodName, arguments, true), assert.CallerInfo())
+			m.fail("\nassert: mock: I don't know what to return because the method call was unexpected.\n\tEither do Mock.On(%#v).Return(...) first, or remove the %s() call.\n\tThis method was unexpected:\n\t\t%s%s\n\tat: %s", methodName, methodName, callString(methodName, arguments, true), branchInfo, assert.CallerInfo())
 		}
 	}
 
@@ -557,6 +883,14 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 	m.Calls = append(m.Calls, *newCall(m, methodName, assert.CallerInfo(), arguments, call.ReturnArguments))
 	m.mutex.Unlock()
 
+	return m.runCall(call, arguments)
+}
+
+// runCall performs the post-admission part of an accepted call: waiting,
+// panicking, running the RunFn callback and returning the return arguments.
+// The mock mutex is never held while RunFn executes, so callbacks may
+// re-enter the mock without deadlocking.
+func (m *Mock) runCall(call *Call, arguments Arguments) Arguments {
 	// block if specified
 	if call.WaitFor != nil {
 		<-call.WaitFor
@@ -631,6 +965,10 @@ func (m *Mock) AssertExpectations(t TestingT) bool {
 	defer m.mutex.Unlock()
 	var failedExpectations int
 
+	if problem := m.validateBranchGroups(); problem != "" {
+		panic(problem)
+	}
+
 	// iterate through each expectation
 	expectedCalls := m.expectedCalls()
 	for _, expectedCall := range expectedCalls {
@@ -638,6 +976,27 @@ func (m *Mock) AssertExpectations(t TestingT) bool {
 		if !satisfied {
 			failedExpectations++
 			t.Logf(reason)
+		}
+	}
+
+	// check branch groups: only the remaining expectations of the selected
+	// branch count; unselected branches are ignored. A group in which no
+	// branch was selected fails unless it was marked optional.
+	for _, group := range m.branchGroups {
+		if group.selected == nil {
+			if !group.optional {
+				failedExpectations++
+				t.Logf("FAIL:\tbranch group %d: no branch was selected", group.index)
+			}
+			continue
+		}
+		branch := group.selected
+		for i := branch.head; i < len(branch.calls); i++ {
+			satisfied, reason := m.checkExpectation(branch.calls[i])
+			if !satisfied {
+				failedExpectations++
+				t.Logf(reason)
+			}
 		}
 	}
 

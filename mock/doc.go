@@ -41,4 +41,43 @@
 //
 // This may cause a panic if the object you are getting is nil (the type assertion will fail), in those
 // cases you should check for nil first.
+//
+// # Mutually Exclusive Branch Groups
+//
+// When a protocol can proceed along exactly one of several paths (for
+// example a successful handshake versus a degraded one), a BranchGroup
+// declares the alternatives as ordered sequences of Call expectations
+// instead of marking everything with Call.Maybe:
+//
+//	m := &mock.Mock{}
+//	group := m.BranchGroup()
+//
+//	modern := group.Branch()
+//	modern.On("Hello").Return("hi")
+//	modern.On("Data", 1).Return("ok")
+//
+//	legacy := group.Branch()
+//	legacy.On("Legacy").Return("old")
+//	legacy.On("Data", 1).Return("ok")
+//
+// All branches start unselected. The first call that matches the first Call
+// of a branch atomically selects that branch; later calls may only consume
+// the selected branch's remaining expectations, in order. A call matching
+// the heads of several branches at once fails with an explicit ambiguity
+// error, and a call matching nothing fails with the usual unexpected call
+// diagnostic, extended with the candidate branch heads.
+//
+// AssertExpectations only checks the remaining expectations of the selected
+// branch; branches that were never selected are ignored. A group in which
+// no branch was ever selected fails the assertion unless it was marked with
+// BranchGroup.Optional.
+//
+// A 90-second example that prints the selection result and the calls that
+// are still unmet:
+//
+//	m.MethodCalled("Legacy")               // selects branch 1
+//	fmt.Println(group.Selected())          // 1
+//	fmt.Println(group.UnmetExpectations()) // [Data(int)]
+//	m.MethodCalled("Data", 1)
+//	fmt.Println(group.UnmetExpectations()) // []
 package mock
