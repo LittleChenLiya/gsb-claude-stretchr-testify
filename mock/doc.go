@@ -41,4 +41,32 @@
 //
 // This may cause a panic if the object you are getting is nil (the type assertion will fail), in those
 // cases you should check for nil first.
+//
+// # Mutually exclusive branch groups
+//
+// When a protocol can proceed down exactly one of several paths (for example
+// a modern handshake versus a legacy fallback), a [BranchGroup] declares the
+// alternatives instead of marking every call with [Call.Maybe]:
+//
+//	group := m.NewBranchGroup()
+//	modern := group.Branch()
+//	modern.On("Hello").Return("hi")
+//	modern.On("Data", 1).Return("ok")
+//	legacy := group.Branch()
+//	legacy.On("Legacy").Return("old")
+//	legacy.On("Data", 2).Return("done")
+//
+// Each branch holds an ordered sequence of [Call] expectations. All branches
+// start unselected; the first incoming call that matches the first Call of a
+// branch atomically selects that branch, and later calls can only consume the
+// remaining expectations of the selected branch. A call that matches the
+// first Call of several branches fails with an ambiguity error, and a call
+// that matches nothing fails with the usual unexpected call diagnostic, now
+// listing the candidate branches.
+//
+// [Mock.AssertExpectations] only checks the remaining expectations of the
+// selected branch; branches that were never selected are not required. A
+// group that was never entered fails the assertion by default, unless it was
+// marked optional with [BranchGroup.Optional]. [BranchGroup.SelectedBranch]
+// reports which branch was selected, or -1 if none was.
 package mock
