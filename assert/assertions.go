@@ -3,6 +3,7 @@ package assert
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2145,6 +2146,194 @@ func EventuallyWithT(t TestingT, condition func(collect *CollectT), waitFor time
 			tickC = ticker.C
 		}
 	}
+}
+
+// Clock abstracts the time source used by EventuallyStable, allowing tests to
+// inject a deterministic fake clock instead of relying on the real time.
+type Clock interface {
+	// Now returns the current time according to the clock.
+	Now() time.Time
+	// After returns a channel that receives the current time once the given
+	// duration has elapsed according to the clock.
+	After(d time.Duration) <-chan time.Time
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+func (realClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
+
+// RealClock returns a Clock backed by the time package. It is the clock used
+// by EventuallyStable when nil is passed.
+func RealClock() Clock { return realClock{} }
+
+// EventuallyStable asserts that the given condition becomes satisfied and
+// then remains satisfied for a continuous stableFor window, before waitFor
+// elapses. In contrast to Eventually, a single successful check is not
+// enough: the condition must hold uninterrupted for the whole stability
+// window. Any failing check (a false return or a panic) resets the stability
+// window, which then restarts from the next successful check.
+//
+// The condition is checked sequentially: the next check is only scheduled
+// after the previous one has finished, so the condition is never run
+// concurrently with itself. A check that panics is recorded as a failure and
+// its panic value is kept as part of the diagnostics reported on timeout,
+// together with the most recent failing check.
+//
+// Both the total timeout (waitFor) and the stability window (stableFor) are
+// measured using the provided clock, which makes the assertion deterministic
+// in tests. If clock is nil, RealClock is used.
+//
+// The provided context stops the assertion: as soon as ctx is canceled no
+// new condition check is scheduled and the assertion fails immediately. An
+// already running check is allowed to finish.
+//
+// The tick interval and waitFor must be greater than zero, and stableFor
+// must not be negative nor greater than waitFor; invalid values fail the
+// assertion immediately without running the condition.
+//
+//	assert.EventuallyStable(t, ctx, func() bool { return ready.Load() }, 10*time.Second, 2*time.Second, 100*time.Millisecond, nil)
+func EventuallyStable(t TestingT, ctx context.Context, condition func() bool, waitFor time.Duration, stableFor time.Duration, tick time.Duration, clock Clock, msgAndArgs ...interface{}) bool {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+
+	if clock == nil {
+		clock = RealClock()
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	if tick <= 0 {
+		return Fail(t, fmt.Sprintf("EventuallyStable: tick interval must be greater than zero, got %v", tick), msgAndArgs...)
+	}
+	if waitFor <= 0 {
+		return Fail(t, fmt.Sprintf("EventuallyStable: waitFor must be greater than zero, got %v", waitFor), msgAndArgs...)
+	}
+	if stableFor < 0 {
+		return Fail(t, fmt.Sprintf("EventuallyStable: stableFor must not be negative, got %v", stableFor), msgAndArgs...)
+	}
+	if stableFor > waitFor {
+		return Fail(t, fmt.Sprintf("EventuallyStable: stableFor (%v) must not be greater than waitFor (%v)", stableFor, waitFor), msgAndArgs...)
+	}
+
+	deadline := clock.Now().Add(waitFor)
+
+	var (
+		checks        int
+		stable        bool
+		stableSince   time.Time
+		stableWindows []time.Duration
+		lastFailure   string
+	)
+	// recordWindow closes the currently open stability window (if any) so it
+	// can be reported in the failure diagnostics.
+	recordWindow := func(now time.Time) {
+		if stable {
+			stableWindows = append(stableWindows, now.Sub(stableSince))
+			stable = false
+		}
+	}
+
+	for {
+		// A canceled context stops the assertion immediately: no new
+		// condition check is scheduled from this point on.
+		if err := ctx.Err(); err != nil {
+			recordWindow(clock.Now())
+			return Fail(t, fmt.Sprintf(
+				"EventuallyStable: context canceled before the condition stayed satisfied for a continuous %v: %v\nchecks run: %d\n%s\nlast failure: %s",
+				stableFor, err, checks, formatStableWindows(stableWindows), lastFailureOrNone(lastFailure)), msgAndArgs...)
+		}
+
+		now := clock.Now()
+		if !now.Before(deadline) {
+			recordWindow(now)
+			return Fail(t, fmt.Sprintf(
+				"EventuallyStable: condition did not stay satisfied for a continuous %v within %v (timeout)\nchecks run: %d\n%s\nlast failure: %s",
+				stableFor, waitFor, checks, formatStableWindows(stableWindows), lastFailureOrNone(lastFailure)), msgAndArgs...)
+		}
+
+		checks++
+		ok, panicValue := safelyCallCondition(condition)
+		now = clock.Now()
+
+		switch {
+		case panicValue != nil:
+			recordWindow(now)
+			lastFailure = fmt.Sprintf("check #%d panicked at %s: %v", checks, now.Format(time.RFC3339Nano), panicValue)
+		case !ok:
+			recordWindow(now)
+			lastFailure = fmt.Sprintf("check #%d returned false at %s", checks, now.Format(time.RFC3339Nano))
+		default:
+			if !stable {
+				stable = true
+				stableSince = now
+			}
+			if now.Sub(stableSince) >= stableFor {
+				return true
+			}
+		}
+
+		// The next check is scheduled only after the current one has
+		// finished. Never wait past the deadline.
+		wait := tick
+		if remaining := deadline.Sub(now); remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			// Reported at the top of the next iteration.
+		case <-clock.After(wait):
+		}
+	}
+}
+
+// safelyCallCondition runs condition and converts a panic into a failure
+// result, keeping the panic value for diagnostics.
+func safelyCallCondition(condition func() bool) (ok bool, panicValue interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+			panicValue = r
+		}
+	}()
+	return condition(), nil
+}
+
+// formatStableWindows renders the completed stability windows for failure
+// diagnostics, capping the list to keep messages readable.
+func formatStableWindows(windows []time.Duration) string {
+	if len(windows) == 0 {
+		return "stable windows: none (condition never satisfied)"
+	}
+	const maxReported = 10
+	shown := windows
+	extra := 0
+	if len(windows) > maxReported {
+		shown = windows[len(windows)-maxReported:]
+		extra = len(windows) - maxReported
+	}
+	parts := make([]string, len(shown))
+	for i, w := range shown {
+		parts[i] = w.String()
+	}
+	s := fmt.Sprintf("stable windows: [%s]", strings.Join(parts, ", "))
+	if extra > 0 {
+		s += fmt.Sprintf(" (and %d earlier)", extra)
+	}
+	return s
+}
+
+func lastFailureOrNone(lastFailure string) string {
+	if lastFailure == "" {
+		return "none"
+	}
+	return lastFailure
 }
 
 // Never asserts that the given condition doesn't satisfy in waitFor time,

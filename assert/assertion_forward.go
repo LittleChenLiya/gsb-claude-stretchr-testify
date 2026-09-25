@@ -3,6 +3,7 @@
 package assert
 
 import (
+	context "context"
 	http "net/http"
 	url "net/url"
 	time "time"
@@ -331,6 +332,72 @@ func (a *Assertions) Eventually(condition func() bool, waitFor time.Duration, ti
 		h.Helper()
 	}
 	return Eventually(a.t, condition, waitFor, tick, msgAndArgs...)
+}
+
+// EventuallyStable asserts that the given condition becomes satisfied and
+// then remains satisfied for a continuous stableFor window, before waitFor
+// elapses. In contrast to Eventually, a single successful check is not
+// enough: the condition must hold uninterrupted for the whole stability
+// window. Any failing check (a false return or a panic) resets the stability
+// window, which then restarts from the next successful check.
+//
+// The condition is checked sequentially: the next check is only scheduled
+// after the previous one has finished, so the condition is never run
+// concurrently with itself. A check that panics is recorded as a failure and
+// its panic value is kept as part of the diagnostics reported on timeout,
+// together with the most recent failing check.
+//
+// Both the total timeout (waitFor) and the stability window (stableFor) are
+// measured using the provided clock, which makes the assertion deterministic
+// in tests. If clock is nil, RealClock is used.
+//
+// The provided context stops the assertion: as soon as ctx is canceled no
+// new condition check is scheduled and the assertion fails immediately. An
+// already running check is allowed to finish.
+//
+// The tick interval and waitFor must be greater than zero, and stableFor
+// must not be negative nor greater than waitFor; invalid values fail the
+// assertion immediately without running the condition.
+//
+//	a.EventuallyStable(ctx, func() bool { return ready.Load() }, 10*time.Second, 2*time.Second, 100*time.Millisecond, nil)
+func (a *Assertions) EventuallyStable(ctx context.Context, condition func() bool, waitFor time.Duration, stableFor time.Duration, tick time.Duration, clock Clock, msgAndArgs ...interface{}) bool {
+	if h, ok := a.t.(tHelper); ok {
+		h.Helper()
+	}
+	return EventuallyStable(a.t, ctx, condition, waitFor, stableFor, tick, clock, msgAndArgs...)
+}
+
+// EventuallyStablef asserts that the given condition becomes satisfied and
+// then remains satisfied for a continuous stableFor window, before waitFor
+// elapses. In contrast to Eventually, a single successful check is not
+// enough: the condition must hold uninterrupted for the whole stability
+// window. Any failing check (a false return or a panic) resets the stability
+// window, which then restarts from the next successful check.
+//
+// The condition is checked sequentially: the next check is only scheduled
+// after the previous one has finished, so the condition is never run
+// concurrently with itself. A check that panics is recorded as a failure and
+// its panic value is kept as part of the diagnostics reported on timeout,
+// together with the most recent failing check.
+//
+// Both the total timeout (waitFor) and the stability window (stableFor) are
+// measured using the provided clock, which makes the assertion deterministic
+// in tests. If clock is nil, RealClock is used.
+//
+// The provided context stops the assertion: as soon as ctx is canceled no
+// new condition check is scheduled and the assertion fails immediately. An
+// already running check is allowed to finish.
+//
+// The tick interval and waitFor must be greater than zero, and stableFor
+// must not be negative nor greater than waitFor; invalid values fail the
+// assertion immediately without running the condition.
+//
+//	a.EventuallyStablef(ctx, func() bool { return ready.Load() }, 10*time.Second, 2*time.Second, 100*time.Millisecond, nil, "error message %s", "formatted")
+func (a *Assertions) EventuallyStablef(ctx context.Context, condition func() bool, waitFor time.Duration, stableFor time.Duration, tick time.Duration, clock Clock, msg string, args ...interface{}) bool {
+	if h, ok := a.t.(tHelper); ok {
+		h.Helper()
+	}
+	return EventuallyStablef(a.t, ctx, condition, waitFor, stableFor, tick, clock, msg, args...)
 }
 
 // EventuallyWithT asserts that given condition will be met in waitFor time,

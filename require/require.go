@@ -3,6 +3,7 @@
 package require
 
 import (
+	context "context"
 	assert "github.com/stretchr/testify/assert"
 	http "net/http"
 	url "net/url"
@@ -410,6 +411,78 @@ func Eventually(t TestingT, condition func() bool, waitFor time.Duration, tick t
 		h.Helper()
 	}
 	if assert.Eventually(t, condition, waitFor, tick, msgAndArgs...) {
+		return
+	}
+	t.FailNow()
+}
+
+// EventuallyStable asserts that the given condition becomes satisfied and
+// then remains satisfied for a continuous stableFor window, before waitFor
+// elapses. In contrast to Eventually, a single successful check is not
+// enough: the condition must hold uninterrupted for the whole stability
+// window. Any failing check (a false return or a panic) resets the stability
+// window, which then restarts from the next successful check.
+//
+// The condition is checked sequentially: the next check is only scheduled
+// after the previous one has finished, so the condition is never run
+// concurrently with itself. A check that panics is recorded as a failure and
+// its panic value is kept as part of the diagnostics reported on timeout,
+// together with the most recent failing check.
+//
+// Both the total timeout (waitFor) and the stability window (stableFor) are
+// measured using the provided clock, which makes the assertion deterministic
+// in tests. If clock is nil, RealClock is used.
+//
+// The provided context stops the assertion: as soon as ctx is canceled no
+// new condition check is scheduled and the assertion fails immediately. An
+// already running check is allowed to finish.
+//
+// The tick interval and waitFor must be greater than zero, and stableFor
+// must not be negative nor greater than waitFor; invalid values fail the
+// assertion immediately without running the condition.
+//
+//	require.EventuallyStable(t, ctx, func() bool { return ready.Load() }, 10*time.Second, 2*time.Second, 100*time.Millisecond, nil)
+func EventuallyStable(t TestingT, ctx context.Context, condition func() bool, waitFor time.Duration, stableFor time.Duration, tick time.Duration, clock assert.Clock, msgAndArgs ...interface{}) {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	if assert.EventuallyStable(t, ctx, condition, waitFor, stableFor, tick, clock, msgAndArgs...) {
+		return
+	}
+	t.FailNow()
+}
+
+// EventuallyStablef asserts that the given condition becomes satisfied and
+// then remains satisfied for a continuous stableFor window, before waitFor
+// elapses. In contrast to Eventually, a single successful check is not
+// enough: the condition must hold uninterrupted for the whole stability
+// window. Any failing check (a false return or a panic) resets the stability
+// window, which then restarts from the next successful check.
+//
+// The condition is checked sequentially: the next check is only scheduled
+// after the previous one has finished, so the condition is never run
+// concurrently with itself. A check that panics is recorded as a failure and
+// its panic value is kept as part of the diagnostics reported on timeout,
+// together with the most recent failing check.
+//
+// Both the total timeout (waitFor) and the stability window (stableFor) are
+// measured using the provided clock, which makes the assertion deterministic
+// in tests. If clock is nil, RealClock is used.
+//
+// The provided context stops the assertion: as soon as ctx is canceled no
+// new condition check is scheduled and the assertion fails immediately. An
+// already running check is allowed to finish.
+//
+// The tick interval and waitFor must be greater than zero, and stableFor
+// must not be negative nor greater than waitFor; invalid values fail the
+// assertion immediately without running the condition.
+//
+//	require.EventuallyStablef(t, ctx, func() bool { return ready.Load() }, 10*time.Second, 2*time.Second, 100*time.Millisecond, nil, "error message %s", "formatted")
+func EventuallyStablef(t TestingT, ctx context.Context, condition func() bool, waitFor time.Duration, stableFor time.Duration, tick time.Duration, clock assert.Clock, msg string, args ...interface{}) {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	if assert.EventuallyStablef(t, ctx, condition, waitFor, stableFor, tick, clock, msg, args...) {
 		return
 	}
 	t.FailNow()
