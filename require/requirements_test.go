@@ -1,6 +1,7 @@
 package require
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -787,4 +788,38 @@ func TestEventuallyWithTTrue(t *testing.T) {
 	EventuallyWithT(mockT, condition, 100*time.Millisecond, 20*time.Millisecond)
 	False(t, mockT.Failed, "Check should pass")
 	Equal(t, 2, counter, "Condition is expected to be called 2 times")
+}
+
+func TestEventuallyStableTrue(t *testing.T) {
+	t.Parallel()
+
+	mockT := new(MockT)
+
+	counter := 0
+	condition := func() bool {
+		counter++
+		return true
+	}
+
+	EventuallyStable(mockT, context.Background(), condition, 100*time.Millisecond, 0, 20*time.Millisecond, nil)
+	False(t, mockT.Failed, "Check should pass")
+	Equal(t, 1, counter, "Condition is expected to be called 1 time")
+}
+
+func TestEventuallyStableInvalidTick(t *testing.T) {
+	t.Parallel()
+
+	mockT := new(MockT)
+
+	EventuallyStable(mockT, context.Background(), func() bool { return true }, 100*time.Millisecond, 0, 0, nil)
+	True(t, mockT.Failed, "Check should fail")
+}
+
+func TestEventuallyStablefInvalidTick(t *testing.T) {
+	t.Parallel()
+
+	mockT := new(MockT)
+
+	EventuallyStablef(mockT, context.Background(), func() bool { return true }, 100*time.Millisecond, 0, 0, nil, "error message %s", "formatted")
+	True(t, mockT.Failed, "Check should fail")
 }

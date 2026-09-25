@@ -3,6 +3,7 @@
 package require
 
 import (
+	context "context"
 	assert "github.com/stretchr/testify/assert"
 	http "net/http"
 	url "net/url"
@@ -410,6 +411,60 @@ func Eventually(t TestingT, condition func() bool, waitFor time.Duration, tick t
 		h.Helper()
 	}
 	if assert.Eventually(t, condition, waitFor, tick, msgAndArgs...) {
+		return
+	}
+	t.FailNow()
+}
+
+// EventuallyStable asserts that the given condition becomes true and stays
+// true for a continuous stability window (stableFor) within the overall
+// timeout (waitFor). The condition is checked once immediately and then
+// every tick. Unlike Eventually, a single successful check is not enough:
+// every check must succeed for the whole stableFor window. Any failed check
+// resets the stability window, which then restarts from the next successful
+// check.
+//
+// Checks are never run concurrently: the next check is only scheduled after
+// the previous one has finished. A condition that panics is recorded as a
+// failed check, and the diagnostic of the last failure (including the
+// panic value) is reported if the assertion fails. If ctx is canceled, no
+// new checks are scheduled and the assertion fails immediately. If clock is
+// nil, the real system clock is used; both the overall timeout and the
+// stability window are measured against the provided clock.
+//
+//	require.EventuallyStable(t, ctx, func() bool { return true; }, time.Second, 200*time.Millisecond, 10*time.Millisecond, nil)
+func EventuallyStable(t TestingT, ctx context.Context, condition func() bool, waitFor time.Duration, stableFor time.Duration, tick time.Duration, clock assert.Clock, msgAndArgs ...interface{}) {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	if assert.EventuallyStable(t, ctx, condition, waitFor, stableFor, tick, clock, msgAndArgs...) {
+		return
+	}
+	t.FailNow()
+}
+
+// EventuallyStablef asserts that the given condition becomes true and stays
+// true for a continuous stability window (stableFor) within the overall
+// timeout (waitFor). The condition is checked once immediately and then
+// every tick. Unlike Eventually, a single successful check is not enough:
+// every check must succeed for the whole stableFor window. Any failed check
+// resets the stability window, which then restarts from the next successful
+// check.
+//
+// Checks are never run concurrently: the next check is only scheduled after
+// the previous one has finished. A condition that panics is recorded as a
+// failed check, and the diagnostic of the last failure (including the
+// panic value) is reported if the assertion fails. If ctx is canceled, no
+// new checks are scheduled and the assertion fails immediately. If clock is
+// nil, the real system clock is used; both the overall timeout and the
+// stability window are measured against the provided clock.
+//
+//	require.EventuallyStablef(t, ctx, func() bool { return true; }, time.Second, 200*time.Millisecond, 10*time.Millisecond, nil, "error message %s", "formatted")
+func EventuallyStablef(t TestingT, ctx context.Context, condition func() bool, waitFor time.Duration, stableFor time.Duration, tick time.Duration, clock assert.Clock, msg string, args ...interface{}) {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	if assert.EventuallyStablef(t, ctx, condition, waitFor, stableFor, tick, clock, msg, args...) {
 		return
 	}
 	t.FailNow()

@@ -1,6 +1,7 @@
 package require
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -617,6 +618,20 @@ func TestYAMLEqWrapper_ArraysOfDifferentOrder(t *testing.T) {
 	mockRequire := New(mockT)
 
 	mockRequire.YAMLEq(`["foo", {"hello": "world", "nested": "hash"}]`, `[{ "hello": "world", "nested": "hash"}, "foo"]`)
+	if !mockT.Failed {
+		t.Error("Check should fail")
+	}
+}
+
+func TestEventuallyStableWrapper(t *testing.T) {
+	t.Parallel()
+
+	require := New(t)
+	require.EventuallyStable(context.Background(), func() bool { return true }, 100*time.Millisecond, 0, 20*time.Millisecond, nil)
+
+	mockT := new(MockT)
+	mockRequire := New(mockT)
+	mockRequire.EventuallyStable(context.Background(), func() bool { return true }, 100*time.Millisecond, 0, 0, nil)
 	if !mockT.Failed {
 		t.Error("Check should fail")
 	}
