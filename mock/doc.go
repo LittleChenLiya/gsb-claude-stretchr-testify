@@ -41,4 +41,29 @@
 //
 // This may cause a panic if the object you are getting is nil (the type assertion will fail), in those
 // cases you should check for nil first.
+//
+// # Stage Scenarios
+//
+// On top of the regular expectations, a [StageScenario] can enforce explicit
+// execution stages. Each stage holds a number of expectations with their own
+// call counts; calls within a stage may happen in any order, but the next
+// stage only becomes active once every required expectation of the current
+// stage has been consumed:
+//
+//	scenario := mock.NewStageScenario()
+//	scenario.Stage("prepare")
+//	scenario.Expect("A").Return(nil).Times(2)
+//	scenario.Expect("B").Return(nil).Once()
+//	scenario.Stage("commit")
+//	scenario.Expect("Commit").Return(nil).Once()
+//	scenario.Freeze()
+//
+// Expectations marked with [Call.Maybe] are optional: they never block stage
+// advancement, and once their stage is closed their remaining counts can no
+// longer be consumed. Calling [StageScenario.Freeze] commits the scenario;
+// registering further stages or expectations afterwards panics. Violations
+// (calls ahead of the active stage, calls exceeding their count, and
+// unfinished stages at [Mock.AssertExpectations] time) are reported with the
+// stage name and the actual call sequence number. Regular [Mock.On] and
+// [Call.NotBefore] expectations keep working alongside a scenario.
 package mock

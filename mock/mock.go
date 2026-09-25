@@ -78,6 +78,11 @@ type Call struct {
 
 	// Calls which must be satisfied before this call can be
 	requires []*Call
+
+	// stageExp, when non-nil, ties this expectation to a [StageScenario]
+	// stage. The scenario enforces how often and in which stage the call
+	// may be consumed.
+	stageExp *stageExpectation
 }
 
 func newCall(parent *Mock, methodName string, callerInfo []string, methodArguments Arguments, returnArguments Arguments) *Call {
@@ -313,6 +318,10 @@ type Mock struct {
 	// this data completely allowing you to do whatever you like with it.
 	testData objx.Map
 
+	// scenario, when set and frozen, enforces explicit execution stages
+	// over the expectations of this mock. See [StageScenario].
+	scenario *StageScenario
+
 	mutex sync.Mutex
 }
 
@@ -546,6 +555,17 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 		}
 	}
 
+	if m.scenario != nil && m.scenario.frozen {
+		if msg := m.scenario.checkCall(call); msg != "" {
+			m.mutex.Unlock()
+			m.fail("%s", msg)
+			// Unreachable when TestingT.FailNow aborts execution, but
+			// keeps the scenario counts consistent for TestingT
+			// implementations that only record the failure.
+			return nil
+		}
+	}
+
 	if call.Repeatability == 1 {
 		call.Repeatability = -1
 	} else if call.Repeatability > 1 {
@@ -630,6 +650,7 @@ func (m *Mock) AssertExpectations(t TestingT) bool {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	var failedExpectations int
+	var scenarioExpectations int
 
 	// iterate through each expectation
 	expectedCalls := m.expectedCalls()
@@ -641,8 +662,18 @@ func (m *Mock) AssertExpectations(t TestingT) bool {
 		}
 	}
 
+	// iterate through unfinished scenario stages, if any
+	if m.scenario != nil && m.scenario.frozen {
+		for _, reason := range m.scenario.unfinished() {
+			failedExpectations++
+			scenarioExpectations++
+			t.Logf(reason)
+		}
+	}
+
 	if failedExpectations != 0 {
-		t.Errorf("FAIL: %d out of %d expectation(s) were met.\n\tThe code you are testing needs to make %d more call(s).\n\tat: %s", len(expectedCalls)-failedExpectations, len(expectedCalls), failedExpectations, assert.CallerInfo())
+		totalExpectations := len(expectedCalls) + scenarioExpectations
+		t.Errorf("FAIL: %d out of %d expectation(s) were met.\n\tThe code you are testing needs to make %d more call(s).\n\tat: %s", totalExpectations-failedExpectations, totalExpectations, failedExpectations, assert.CallerInfo())
 	}
 
 	return failedExpectations == 0
