@@ -41,4 +41,19 @@
 //
 // This may cause a panic if the object you are getting is nil (the type assertion will fail), in those
 // cases you should check for nil first.
+//
+// # Argument snapshots
+//
+// By default the mock records the exact argument values it was called with, so when a pointer is
+// passed and the pointed-to value is mutated after the call, the recorded call (and therefore
+// [Mock.AssertCalled]) observes the mutated value. Calling [Mock.EnableArgumentSnapshots] opts the
+// mock into snapshot mode: every call records a deep, isolated snapshot of its arguments taken when
+// the call entered the mock, while matching against [Mock.On] expectations and the [Call.Run]
+// callback still operate on the original arguments.
+//
+// Snapshots support basic types, structs, arrays, slices, maps, pointers and interfaces, and
+// preserve shared references and cyclic relationships within a single call. Funcs, channels and
+// struct fields that cannot be accessed safely are reported as unsupported (the call fails and is
+// neither recorded nor counted against [Call.Times]); use [RegisterSnapshotFunc] to register a
+// custom snapshot function for such types.
 package mock

@@ -313,6 +313,10 @@ type Mock struct {
 	// this data completely allowing you to do whatever you like with it.
 	testData objx.Map
 
+	// snapshotArgs, when true, records an isolated snapshot of the call
+	// arguments instead of the original references. See EnableArgumentSnapshots.
+	snapshotArgs bool
+
 	mutex sync.Mutex
 }
 
@@ -332,6 +336,40 @@ func (m *Mock) TestData() objx.Map {
 	}
 
 	return m.testData
+}
+
+// EnableArgumentSnapshots switches the mock into argument snapshot mode.
+//
+// In snapshot mode every recorded call ([Mock.Calls]) stores a deep, isolated
+// snapshot of the arguments taken at the moment the call entered the mock, so
+// later mutations of the original values (for example through a pointer that
+// was passed to the mocked method) do not change what [Mock.AssertCalled],
+// [Mock.AssertNotCalled] and failure reports observe. Matching against
+// expectations set with [Mock.On] and the [Call.Run] callback still operate
+// on the original, live arguments.
+//
+// Snapshots support basic types, structs, arrays, slices, maps, pointers and
+// interfaces, and preserve shared references and cyclic relationships within
+// a single call. Funcs, channels and struct fields that cannot be accessed
+// safely are not supported: the call then fails with an error wrapping
+// [ErrSnapshotUnsupported] and is neither recorded nor counted against
+// [Call.Times]. Use [RegisterSnapshotFunc] to teach the snapshotter how to
+// copy such types.
+//
+// Snapshot mode is disabled by default; the zero Mock behaves exactly as
+// before.
+func (m *Mock) EnableArgumentSnapshots() {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.snapshotArgs = true
+}
+
+// DisableArgumentSnapshots switches the mock back to the default mode in
+// which recorded calls keep the original argument references.
+func (m *Mock) DisableArgumentSnapshots() {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.snapshotArgs = false
 }
 
 /*
@@ -546,15 +584,32 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 		}
 	}
 
+	// Snapshot the arguments before any expectation state is consumed, so
+	// that a snapshot failure neither counts against Times nor leaves a
+	// partially recorded call behind. Taking the snapshot while holding the
+	// mutex also guarantees that recorded calls appear in the order the
+	// calls entered the mock.
+	recordedArguments := Arguments(arguments)
+	if m.snapshotArgs {
+		snapshot, err := snapshotArguments(arguments)
+		if err != nil {
+			m.mutex.Unlock()
+			m.fail("\n\nmock: Failed to snapshot arguments of call\n-----------------------------\n\n%s\n\n%s\n\tat: %s",
+				callString(methodName, arguments, true), err, assert.CallerInfo())
+		}
+		recordedArguments = snapshot
+	}
+
 	if call.Repeatability == 1 {
 		call.Repeatability = -1
 	} else if call.Repeatability > 1 {
 		call.Repeatability--
 	}
+
 	call.totalCalls++
 
 	// add the call
-	m.Calls = append(m.Calls, *newCall(m, methodName, assert.CallerInfo(), arguments, call.ReturnArguments))
+	m.Calls = append(m.Calls, *newCall(m, methodName, assert.CallerInfo(), recordedArguments, call.ReturnArguments))
 	m.mutex.Unlock()
 
 	// block if specified
