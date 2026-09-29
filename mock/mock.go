@@ -313,6 +313,13 @@ type Mock struct {
 	// this data completely allowing you to do whatever you like with it.
 	testData objx.Map
 
+	// argumentSnapshots enables the optional argument snapshot mode. When
+	// enabled, every recorded call stores a deep snapshot of its arguments
+	// taken at call time, so later mutations of the original values do not
+	// affect call records or assertions. Matching of expected calls and the
+	// Run callback still operate on the original arguments.
+	argumentSnapshots bool
+
 	mutex sync.Mutex
 }
 
@@ -346,6 +353,43 @@ func (m *Mock) Test(t TestingT) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.test = t
+}
+
+// EnableArgumentSnapshots turns on the optional argument snapshot mode.
+//
+// In the default mode the mock records the arguments as they are passed, so
+// when a test mutates an object after handing a pointer to it to the mocked
+// method, the recorded call (and therefore [Mock.AssertCalled] and failure
+// reports) reflects the mutated, later state.
+//
+// With argument snapshots enabled, each call records exactly one deep
+// snapshot of its arguments, taken while the call enters the mock. The
+// snapshot is used for the call record and for subsequent assertions such
+// as [Mock.AssertCalled], while matching of expected calls and the [Call.Run]
+// callback still receive the original arguments. Snapshots preserve shared
+// references and cyclic structures, and support basic kinds, structs,
+// arrays, slices, maps, pointers and interfaces.
+//
+// Values of kind func, chan or unsafe.Pointer, and structs with unexported
+// fields, cannot be snapshotted by the built-in logic and cause the call to
+// fail with an explicit error; such values are never silently replaced with
+// nil. Use [RegisterSnapshotFunc] to teach the mock how to snapshot them.
+// When a snapshot fails, the call does not consume a [Call.Times] allowance
+// and no partial call record is written.
+//
+// Concurrent calls are recorded in the order in which they enter the mock.
+func (m *Mock) EnableArgumentSnapshots() {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.argumentSnapshots = true
+}
+
+// DisableArgumentSnapshots turns the argument snapshot mode back off,
+// restoring the default behavior of recording the arguments as passed.
+func (m *Mock) DisableArgumentSnapshots() {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.argumentSnapshots = false
 }
 
 // fail fails the current test with the given formatted format and args.
@@ -546,6 +590,22 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 		}
 	}
 
+	recordedArguments := Arguments(arguments)
+	if m.argumentSnapshots {
+		// Take exactly one snapshot of the arguments for the call record.
+		// This happens before the call consumes any repeatability so that a
+		// snapshot failure neither eats a Times allowance nor leaves a
+		// partial call record behind. Matching above and the Run callback
+		// below still use the original arguments.
+		snapshot, err := snapshotArguments(recordedArguments)
+		if err != nil {
+			m.mutex.Unlock()
+			m.fail("\n\nmock: Failed to record method call\n-----------------------------\n\n%s\n\n%s\n\tat: %s",
+				callString(methodName, arguments, true), err, assert.CallerInfo())
+		}
+		recordedArguments = snapshot
+	}
+
 	if call.Repeatability == 1 {
 		call.Repeatability = -1
 	} else if call.Repeatability > 1 {
@@ -553,8 +613,9 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 	}
 	call.totalCalls++
 
-	// add the call
-	m.Calls = append(m.Calls, *newCall(m, methodName, assert.CallerInfo(), arguments, call.ReturnArguments))
+	// add the call; appending while holding the mutex keeps the records of
+	// concurrent calls in the order in which they entered the mock
+	m.Calls = append(m.Calls, *newCall(m, methodName, assert.CallerInfo(), recordedArguments, call.ReturnArguments))
 	m.mutex.Unlock()
 
 	// block if specified
@@ -676,6 +737,7 @@ func (m *Mock) AssertNumberOfCalls(t TestingT, methodName string, expectedCalls 
 
 // AssertCalled asserts that the method was called.
 // It can produce a false result when an argument is a pointer type and the underlying value changed after calling the mocked method.
+// Use [Mock.EnableArgumentSnapshots] to assert against a snapshot of the arguments taken at call time instead.
 func (m *Mock) AssertCalled(t TestingT, methodName string, arguments ...interface{}) bool {
 	if h, ok := t.(tHelper); ok {
 		h.Helper()
@@ -699,6 +761,7 @@ func (m *Mock) AssertCalled(t TestingT, methodName string, arguments ...interfac
 
 // AssertNotCalled asserts that the method was not called.
 // It can produce a false result when an argument is a pointer type and the underlying value changed after calling the mocked method.
+// Use [Mock.EnableArgumentSnapshots] to assert against a snapshot of the arguments taken at call time instead.
 func (m *Mock) AssertNotCalled(t TestingT, methodName string, arguments ...interface{}) bool {
 	if h, ok := t.(tHelper); ok {
 		h.Helper()
