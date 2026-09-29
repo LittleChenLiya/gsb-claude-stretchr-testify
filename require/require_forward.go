@@ -3,6 +3,7 @@
 package require
 
 import (
+	context "context"
 	assert "github.com/stretchr/testify/assert"
 	http "net/http"
 	url "net/url"
@@ -332,6 +333,62 @@ func (a *Assertions) Eventually(condition func() bool, waitFor time.Duration, ti
 		h.Helper()
 	}
 	Eventually(a.t, condition, waitFor, tick, msgAndArgs...)
+}
+
+// EventuallyStateSequence asserts that the system under test goes through an
+// ordered sequence of states. The sampler is invoked periodically and each
+// sampled state is checked against the matcher of the current stage only;
+// a stage is advanced to the next one once its matcher is satisfied. A
+// single sample advances at most one stage, so the system under test must
+// pass through every stage in order (states that skip a stage fail the
+// assertion). The assertion succeeds when all stages have been reached
+// before ctx is cancelled.
+//
+// The clock used for sampling can be injected with WithStateSequenceClock,
+// which makes the assertion fully deterministic in tests.
+//
+//	states := []StateMatcherFunc{
+//		func(state interface{}) bool { return state == "ready" },
+//		func(state interface{}) bool { return state == "working" },
+//		func(state interface{}) bool { return state == "done" },
+//	}
+//	sampler := func() (interface{}, error) {
+//		return currentStatus(), nil
+//	}
+//	EventuallyStateSequence(t, ctx, sampler, states)
+func (a *Assertions) EventuallyStateSequence(ctx context.Context, sampler assert.StateSampleFunc, states []assert.StateMatcherFunc, opts []assert.StateSequenceOption, msgAndArgs ...interface{}) {
+	if h, ok := a.t.(tHelper); ok {
+		h.Helper()
+	}
+	EventuallyStateSequence(a.t, ctx, sampler, states, opts, msgAndArgs...)
+}
+
+// EventuallyStateSequencef asserts that the system under test goes through an
+// ordered sequence of states. The sampler is invoked periodically and each
+// sampled state is checked against the matcher of the current stage only;
+// a stage is advanced to the next one once its matcher is satisfied. A
+// single sample advances at most one stage, so the system under test must
+// pass through every stage in order (states that skip a stage fail the
+// assertion). The assertion succeeds when all stages have been reached
+// before ctx is cancelled.
+//
+// The clock used for sampling can be injected with WithStateSequenceClock,
+// which makes the assertion fully deterministic in tests.
+//
+//	states := []StateMatcherFunc{
+//		func(state interface{}) bool { return state == "ready" },
+//		func(state interface{}) bool { return state == "working" },
+//		func(state interface{}) bool { return state == "done" },
+//	}
+//	sampler := func() (interface{}, error) {
+//		return currentStatus(), nil
+//	}
+//	EventuallyStateSequencef(t, ctx, sampler, states, "error message %s", "formatted")
+func (a *Assertions) EventuallyStateSequencef(ctx context.Context, sampler assert.StateSampleFunc, states []assert.StateMatcherFunc, opts []assert.StateSequenceOption, msg string, args ...interface{}) {
+	if h, ok := a.t.(tHelper); ok {
+		h.Helper()
+	}
+	EventuallyStateSequencef(a.t, ctx, sampler, states, opts, msg, args...)
 }
 
 // EventuallyWithT asserts that given condition will be met in waitFor time,
