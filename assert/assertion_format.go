@@ -3,6 +3,7 @@
 package assert
 
 import (
+	context "context"
 	http "net/http"
 	url "net/url"
 	time "time"
@@ -174,6 +175,41 @@ func Eventuallyf(t TestingT, condition func() bool, waitFor time.Duration, tick 
 		h.Helper()
 	}
 	return Eventually(t, condition, waitFor, tick, append([]interface{}{msg}, args...)...)
+}
+
+// EventuallySequencef asserts that a sampled object visits an ordered
+// sequence of states rather than merely reaching the final state.
+//
+// The sample function is invoked once immediately and again after every tick.
+// Each successful sample is evaluated against the stage currently awaited.
+// Stages must be matched strictly in order: a sample may advance at most one
+// stage per invocation, and a sample that skips a stage matches neither the
+// earlier nor the later checker. The assertion succeeds once every stage has
+// matched in turn.
+//
+// Errors returned by sample do not advance any stage and do not fail the
+// assertion immediately; sampling continues until ctx is canceled or its
+// deadline is reached. If the wait ends first, the number of samples taken,
+// the stage that was awaited, and the last sampling error (if any) are
+// reported.
+//
+// clock is an injectable [SamplingClock] allowing tests to drive ticks
+// deterministically; pass nil to use [SystemClock].
+//
+// The example below waits for "ready", then "working", then "done":
+//
+//	assert.EventuallySequencef(t, ctx, func() (interface{}, error) {
+//		return job.State(), nil
+//	}, []assert.Stage{
+//		assert.NewStage("ready", func(s interface{}) bool { return s == "ready" }),
+//		assert.NewStage("working", func(s interface{}) bool { return s == "working" }),
+//		assert.NewStage("done", func(s interface{}) bool { return s == "done" }),
+//	}, 10*time.Millisecond, nil)
+func EventuallySequencef(t TestingT, ctx context.Context, sample func() (interface{}, error), stages []Stage, tick time.Duration, clock SamplingClock, msg string, args ...interface{}) bool {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	return EventuallySequence(t, ctx, sample, stages, tick, clock, append([]interface{}{msg}, args...)...)
 }
 
 // EventuallyWithTf asserts that given condition will be met in waitFor time,

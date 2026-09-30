@@ -3,6 +3,7 @@
 package require
 
 import (
+	context "context"
 	assert "github.com/stretchr/testify/assert"
 	http "net/http"
 	url "net/url"
@@ -410,6 +411,82 @@ func Eventually(t TestingT, condition func() bool, waitFor time.Duration, tick t
 		h.Helper()
 	}
 	if assert.Eventually(t, condition, waitFor, tick, msgAndArgs...) {
+		return
+	}
+	t.FailNow()
+}
+
+// EventuallySequence asserts that a sampled object visits an ordered
+// sequence of states rather than merely reaching the final state.
+//
+// The sample function is invoked once immediately and again after every tick.
+// Each successful sample is evaluated against the stage currently awaited.
+// Stages must be matched strictly in order: a sample may advance at most one
+// stage per invocation, and a sample that skips a stage matches neither the
+// earlier nor the later checker. The assertion succeeds once every stage has
+// matched in turn.
+//
+// Errors returned by sample do not advance any stage and do not fail the
+// assertion immediately; sampling continues until ctx is canceled or its
+// deadline is reached. If the wait ends first, the number of samples taken,
+// the stage that was awaited, and the last sampling error (if any) are
+// reported.
+//
+// clock is an injectable [SamplingClock] allowing tests to drive ticks
+// deterministically; pass nil to use [SystemClock].
+//
+// The example below waits for "ready", then "working", then "done":
+//
+//	require.EventuallySequence(t, ctx, func() (interface{}, error) {
+//		return job.State(), nil
+//	}, []require.Stage{
+//		require.NewStage("ready", func(s interface{}) bool { return s == "ready" }),
+//		require.NewStage("working", func(s interface{}) bool { return s == "working" }),
+//		require.NewStage("done", func(s interface{}) bool { return s == "done" }),
+//	}, 10*time.Millisecond, nil)
+func EventuallySequence(t TestingT, ctx context.Context, sample func() (interface{}, error), stages []assert.Stage, tick time.Duration, clock assert.SamplingClock, msgAndArgs ...interface{}) {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	if assert.EventuallySequence(t, ctx, sample, stages, tick, clock, msgAndArgs...) {
+		return
+	}
+	t.FailNow()
+}
+
+// EventuallySequencef asserts that a sampled object visits an ordered
+// sequence of states rather than merely reaching the final state.
+//
+// The sample function is invoked once immediately and again after every tick.
+// Each successful sample is evaluated against the stage currently awaited.
+// Stages must be matched strictly in order: a sample may advance at most one
+// stage per invocation, and a sample that skips a stage matches neither the
+// earlier nor the later checker. The assertion succeeds once every stage has
+// matched in turn.
+//
+// Errors returned by sample do not advance any stage and do not fail the
+// assertion immediately; sampling continues until ctx is canceled or its
+// deadline is reached. If the wait ends first, the number of samples taken,
+// the stage that was awaited, and the last sampling error (if any) are
+// reported.
+//
+// clock is an injectable [SamplingClock] allowing tests to drive ticks
+// deterministically; pass nil to use [SystemClock].
+//
+// The example below waits for "ready", then "working", then "done":
+//
+//	require.EventuallySequencef(t, ctx, func() (interface{}, error) {
+//		return job.State(), nil
+//	}, []require.Stage{
+//		require.NewStage("ready", func(s interface{}) bool { return s == "ready" }),
+//		require.NewStage("working", func(s interface{}) bool { return s == "working" }),
+//		require.NewStage("done", func(s interface{}) bool { return s == "done" }),
+//	}, 10*time.Millisecond, nil)
+func EventuallySequencef(t TestingT, ctx context.Context, sample func() (interface{}, error), stages []assert.Stage, tick time.Duration, clock assert.SamplingClock, msg string, args ...interface{}) {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	if assert.EventuallySequencef(t, ctx, sample, stages, tick, clock, msg, args...) {
 		return
 	}
 	t.FailNow()
