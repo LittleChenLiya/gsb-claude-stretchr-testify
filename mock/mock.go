@@ -294,6 +294,187 @@ func InOrder(calls ...*Call) {
 	}
 }
 
+/*
+	Scenario
+*/
+
+// Scenario describes an explicit, ordered sequence of phases for a [Mock].
+//
+// Each phase holds a set of expectations, each with its own required call
+// count. Calls within the same phase may happen in any order, but a call
+// belonging to a later phase is rejected until every required expectation of
+// the current phase has been satisfied. Optional expectations (see
+// [Call.Maybe]) never block phase advancement, and once a phase is closed its
+// optional expectations can no longer be consumed.
+//
+// A scenario is registered with [Scenario.Phase] and [Scenario.On] and must
+// be sealed with [Scenario.Freeze] before the mock is used. Freezing a
+// scenario twice, or freezing it while a non-optional expectation lacks an
+// explicit call count, panics.
+//
+// Scenario failures report only the phase name, the method name and the
+// sequence number of the actual call; argument formatting remains governed
+// by the regular [Mock] formatting policy.
+type Scenario struct {
+	mock   *Mock
+	phases []*scenarioPhase
+	frozen bool
+	active int
+	seq    int
+}
+
+type scenarioPhase struct {
+	name    string
+	expects []*scenarioExpectation
+	closed  bool
+}
+
+type scenarioExpectation struct {
+	call     *Call
+	required int
+	done     int
+}
+
+// NewScenario creates a [Scenario] bound to m. Expectations registered
+// through the returned scenario are regular [Mock.On] expectations, so
+// [Call.Return], [Call.Times], [Call.Maybe], [Call.NotBefore] and the other
+// [Call] modifiers keep working as usual.
+func NewScenario(m *Mock) *Scenario {
+	if m == nil {
+		panic("mock: NewScenario requires a non-nil Mock")
+	}
+	s := &Scenario{mock: m}
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.scenario = s
+	return s
+}
+
+// Phase starts a new phase named name. Expectations registered afterwards
+// with [Scenario.On] belong to this phase until the next Phase call. It
+// panics if the scenario has already been frozen.
+func (s *Scenario) Phase(name string) *Scenario {
+	s.mock.mutex.Lock()
+	defer s.mock.mutex.Unlock()
+	if s.frozen {
+		panic(fmt.Sprintf("mock: scenario is frozen; cannot add phase %q", name))
+	}
+	s.phases = append(s.phases, &scenarioPhase{name: name})
+	return s
+}
+
+// On registers an expectation in the current phase. It behaves exactly like
+// [Mock.On] and returns the created [Call] so that Return, Once, Times,
+// Maybe, NotBefore and friends can be chained onto it. It panics if no phase
+// has been started yet or if the scenario has already been frozen.
+func (s *Scenario) On(methodName string, arguments ...interface{}) *Call {
+	s.mock.mutex.Lock()
+	if s.frozen {
+		s.mock.mutex.Unlock()
+		panic(fmt.Sprintf("mock: scenario is frozen; cannot add expectation %q", methodName))
+	}
+	if len(s.phases) == 0 {
+		s.mock.mutex.Unlock()
+		panic(fmt.Sprintf("mock: scenario expectation %q must be registered after a Phase", methodName))
+	}
+	s.mock.mutex.Unlock()
+
+	call := s.mock.On(methodName, arguments...)
+
+	s.mock.mutex.Lock()
+	phase := s.phases[len(s.phases)-1]
+	phase.expects = append(phase.expects, &scenarioExpectation{call: call})
+	s.mock.mutex.Unlock()
+	return call
+}
+
+// Freeze seals the scenario: no further phases or expectations may be
+// registered, and from this point on every call to the mock is checked
+// against the phase order. Each non-optional expectation must declare its
+// required call count via [Call.Once]/[Call.Times] before freezing; optional
+// expectations (see [Call.Maybe]) never block phase advancement. Freeze
+// panics if the scenario is already frozen, has no phases, has an empty
+// phase, or contains a non-optional expectation without a call count.
+func (s *Scenario) Freeze() {
+	m := s.mock
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	if s.frozen {
+		panic("mock: scenario is already frozen")
+	}
+	if len(s.phases) == 0 {
+		panic("mock: scenario has no phases")
+	}
+	for _, phase := range s.phases {
+		if len(phase.expects) == 0 {
+			panic(fmt.Sprintf("mock: scenario phase %q has no expectations", phase.name))
+		}
+		for _, exp := range phase.expects {
+			switch {
+			case exp.call.optional:
+				exp.required = 0
+			case exp.call.Repeatability > 0:
+				exp.required = exp.call.Repeatability
+			default:
+				panic(fmt.Sprintf("mock: scenario expectation %q in phase %q must declare a call count via Once/Times, or be marked optional via Maybe", exp.call.Method, phase.name))
+			}
+		}
+	}
+	s.frozen = true
+	// Skip phases that are already complete (e.g. phases holding only
+	// optional expectations) before the first call arrives.
+	s.advance()
+}
+
+// findExpectation locates the phase and expectation tracking call. The
+// caller must hold the mock's mutex.
+func (s *Scenario) findExpectation(call *Call) (*scenarioPhase, int, *scenarioExpectation) {
+	for i, phase := range s.phases {
+		for _, exp := range phase.expects {
+			if exp.call == call {
+				return phase, i, exp
+			}
+		}
+	}
+	return nil, -1, nil
+}
+
+// unavailableReason explains why call may not be consumed right now. The
+// caller must hold the mock's mutex.
+func (s *Scenario) unavailableReason(call *Call) string {
+	phase, idx, _ := s.findExpectation(call)
+	switch {
+	case idx < s.active:
+		return fmt.Sprintf("phase %q is already closed", phase.name)
+	case idx > s.active:
+		return fmt.Sprintf("phase %q is not complete yet", s.phases[s.active].name)
+	default:
+		return fmt.Sprintf("call count exceeded in phase %q", phase.name)
+	}
+}
+
+// advance closes every leading phase whose required expectations are all
+// satisfied. It is consulted before the first call (from Freeze) and again
+// after each consumed call, so the active phase is re-checked on both sides
+// of a transition. The caller must hold the mock's mutex.
+func (s *Scenario) advance() {
+	for s.active < len(s.phases) && s.phases[s.active].complete() {
+		s.phases[s.active].closed = true
+		s.active++
+	}
+}
+
+// complete reports whether every required expectation of the phase has been
+// satisfied. Optional expectations never block completion.
+func (p *scenarioPhase) complete() bool {
+	for _, exp := range p.expects {
+		if exp.done < exp.required {
+			return false
+		}
+	}
+	return true
+}
+
 // Mock is the workhorse used to track activity on another object.
 // For an example of its usage, refer to the "Example Usage" section at the top
 // of this document.
@@ -308,6 +489,10 @@ type Mock struct {
 	// test is An optional variable that holds the test struct, to be used when an
 	// invalid mock call was made.
 	test TestingT
+
+	// scenario, when non-nil and frozen, gates every call according to the
+	// registered phases.
+	scenario *Scenario
 
 	// TestData holds any data that might be useful for testing.  Testify ignores
 	// this data completely allowing you to do whatever you like with it.
@@ -498,11 +683,26 @@ func (m *Mock) Called(arguments ...interface{}) Arguments {
 func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Arguments {
 	m.mutex.Lock()
 	// TODO: could combine expected and closes in single loop
+	scenario := m.scenario
+	if scenario != nil && !scenario.frozen {
+		scenario = nil
+	}
+	var callSeq int
+	if scenario != nil {
+		scenario.seq++
+		callSeq = scenario.seq
+	}
 	found, call := m.findExpectedCall(methodName, arguments...)
 
 	if found < 0 {
 		// expected call found, but it has already been called with repeatable times
 		if call != nil {
+			if scenario != nil {
+				if _, _, exp := scenario.findExpectation(call); exp != nil {
+					m.mutex.Unlock()
+					m.fail("mock: scenario: unexpected call #%d of %q: %s", callSeq, methodName, scenario.unavailableReason(call))
+				}
+			}
 			m.mutex.Unlock()
 			m.fail("\nassert: mock: The method has been called over %d times.\n\tEither do one more Mock.On(%#v).Return(...), or remove extra call.\n\tThis call was unexpected:\n\t\t%s\n\tat: %s", call.totalCalls, methodName, callString(methodName, arguments, true), assert.CallerInfo())
 		}
@@ -524,6 +724,23 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 			)
 		} else {
 			m.fail("\nassert: mock: I don't know what to return because the method call was unexpected.\n\tEither do Mock.On(%#v).Return(...) first, or remove the %s() call.\n\tThis method was unexpected:\n\t\t%s\n\tat: %s", methodName, methodName, callString(methodName, arguments, true), assert.CallerInfo())
+		}
+	}
+
+	var scenarioExp *scenarioExpectation
+	if scenario != nil {
+		phase, phaseIdx, exp := scenario.findExpectation(call)
+		if exp != nil {
+			switch {
+			case phaseIdx < scenario.active:
+				m.mutex.Unlock()
+				m.fail("mock: scenario: unexpected call #%d of %q: phase %q is already closed", callSeq, methodName, phase.name)
+			case phaseIdx > scenario.active:
+				m.mutex.Unlock()
+				m.fail("mock: scenario: unexpected call #%d of %q: phase %q is not complete yet", callSeq, methodName, scenario.phases[scenario.active].name)
+			default:
+				scenarioExp = exp
+			}
 		}
 	}
 
@@ -552,6 +769,10 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 		call.Repeatability--
 	}
 	call.totalCalls++
+	if scenarioExp != nil {
+		scenarioExp.done++
+		scenario.advance()
+	}
 
 	// add the call
 	m.Calls = append(m.Calls, *newCall(m, methodName, assert.CallerInfo(), arguments, call.ReturnArguments))
@@ -645,7 +866,25 @@ func (m *Mock) AssertExpectations(t TestingT) bool {
 		t.Errorf("FAIL: %d out of %d expectation(s) were met.\n\tThe code you are testing needs to make %d more call(s).\n\tat: %s", len(expectedCalls)-failedExpectations, len(expectedCalls), failedExpectations, assert.CallerInfo())
 	}
 
-	return failedExpectations == 0
+	scenarioComplete := true
+	if scenario := m.scenario; scenario != nil && scenario.frozen {
+		for _, phase := range scenario.phases {
+			if phase.closed {
+				continue
+			}
+			for _, exp := range phase.expects {
+				if exp.done < exp.required {
+					scenarioComplete = false
+					t.Logf("mock: scenario: phase %q incomplete after %d call(s): %q satisfied %d of %d required call(s)", phase.name, scenario.seq, exp.call.Method, exp.done, exp.required)
+				}
+			}
+		}
+		if !scenarioComplete {
+			t.Errorf("FAIL: mock: scenario incomplete after %d call(s).\n\tat: %s", scenario.seq, assert.CallerInfo())
+		}
+	}
+
+	return failedExpectations == 0 && scenarioComplete
 }
 
 func (m *Mock) checkExpectation(call *Call) (bool, string) {
