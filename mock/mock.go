@@ -21,6 +21,29 @@ import (
 // regex for GCCGO functions
 var gccgoRE = regexp.MustCompile(`\.pN\d+_`)
 
+// callerInfoForOn captures the file:line of the caller of [Mock.On] (or
+// [Call.On]) for expectation reports. Unlike assert.CallerInfo it does not
+// filter frames based on forward-slash path segments, so it keeps working when
+// the toolchain reports drive-qualified paths (for example on Windows).
+func callerInfoForOn() []string {
+	pcs := make([]uintptr, 8)
+	n := runtime.Callers(2, pcs)
+	frames := runtime.CallersFrames(pcs[:n])
+
+	for {
+		frame, more := frames.Next()
+		// Skip the Mock.On / Call.On frames themselves.
+		if !strings.HasSuffix(frame.Function, "mock.(*Mock).On") &&
+			!strings.HasSuffix(frame.Function, "mock.(*Call).On") {
+			return []string{fmt.Sprintf("%s:%d", frame.File, frame.Line)}
+		}
+		if !more {
+			break
+		}
+	}
+	return nil
+}
+
 // TestingT is an interface wrapper around *testing.T
 type TestingT interface {
 	Logf(format string, args ...interface{})
@@ -376,7 +399,7 @@ func (m *Mock) On(methodName string, arguments ...interface{}) *Call {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	c := newCall(m, methodName, assert.CallerInfo(), arguments, make([]interface{}, 0))
+	c := newCall(m, methodName, callerInfoForOn(), arguments, make([]interface{}, 0))
 	m.ExpectedCalls = append(m.ExpectedCalls, c)
 	return c
 }
