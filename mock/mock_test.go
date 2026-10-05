@@ -987,6 +987,217 @@ func Test_Mock_Return_Nothing(t *testing.T) {
 	assert.Equal(t, 0, len(call.ReturnArguments))
 }
 
+func Test_Mock_ReturnDynamic(t *testing.T) {
+	t.Parallel()
+
+	// make a test impl object
+	var mockedService = new(TestExampleImplementation)
+
+	var (
+		gotMethod string
+		gotIndex  int
+		gotArgs   Arguments
+	)
+
+	c := mockedService.Mock.
+		On("TheExampleMethod", 1, 2, 3).
+		ReturnDynamic(func(methodName string, callIndex int, args Arguments) []interface{} {
+			gotMethod = methodName
+			gotIndex = callIndex
+			gotArgs = args
+			return []interface{}{callIndex * 10, nil}
+		})
+
+	require.Equal(t, []*Call{c}, mockedService.ExpectedCalls)
+	require.NotNil(t, c.ReturnDynamicFn)
+
+	ret := mockedService.MethodCalled("TheExampleMethod", 1, 2, 3)
+
+	assert.Equal(t, "TheExampleMethod", gotMethod)
+	assert.Equal(t, 1, gotIndex)
+	assert.Equal(t, Arguments{1, 2, 3}, gotArgs)
+	assert.Equal(t, 10, ret[0])
+}
+
+func Test_Mock_ReturnDynamic_OutOfOrder(t *testing.T) {
+	t.Parallel()
+
+	// make a test impl object
+	var mockedService = new(TestExampleImplementation)
+
+	// Unbuffered channels: a send only completes once the call is blocked
+	// waiting on the channel.
+	ch1 := make(chan time.Time)
+	ch2 := make(chan time.Time)
+
+	mockedService.Mock.
+		On("TheExampleMethod", "first").
+		WaitUntil(ch1).
+		ReturnDynamic(func(methodName string, callIndex int, args Arguments) []interface{} {
+			return []interface{}{fmt.Sprintf("%s-%d", methodName, callIndex)}
+		})
+	mockedService.Mock.
+		On("TheExampleMethod", "second").
+		WaitUntil(ch2).
+		ReturnDynamic(func(methodName string, callIndex int, args Arguments) []interface{} {
+			return []interface{}{fmt.Sprintf("%s-%d", methodName, callIndex)}
+		})
+
+	results := make(chan string, 2)
+
+	go func() {
+		results <- mockedService.MethodCalled("TheExampleMethod", "first").Get(0).(string)
+	}()
+
+	// Wait until the first call has been selected and recorded (this
+	// happens before the wait), so it is guaranteed to get index 1.
+	for {
+		mockedService.mutex.Lock()
+		recorded := len(mockedService.Calls)
+		mockedService.mutex.Unlock()
+		if recorded > 0 {
+			break
+		}
+		runtime.Gosched()
+	}
+
+	go func() {
+		results <- mockedService.MethodCalled("TheExampleMethod", "second").Get(0).(string)
+	}()
+
+	// Release the second call (index 2) first: the send blocks until the
+	// second call is actually waiting, so both calls are now blocked.
+	ch2 <- time.Now()
+	// Then release the first call (index 1): completion order is the
+	// reverse of selection order, but each call must keep its own index.
+	ch1 <- time.Now()
+
+	first := <-results
+	second := <-results
+
+	assert.Equal(t, "TheExampleMethod-2", first)
+	assert.Equal(t, "TheExampleMethod-1", second)
+}
+
+func Test_Mock_ReturnDynamic_Reentrant(t *testing.T) {
+	t.Parallel()
+
+	// make a test impl object
+	var mockedService = new(TestExampleImplementation)
+	var other = new(TestExampleImplementation)
+
+	other.Mock.On("TheExampleMethod2", true).Return()
+	mockedService.Mock.On("TheExampleMethod2", false).Return()
+
+	mockedService.Mock.
+		On("TheExampleMethod", 1, 2, 3).
+		ReturnDynamic(func(methodName string, callIndex int, args Arguments) []interface{} {
+			// Call back into another mock while computing the return: this
+			// must not deadlock as the callback runs outside the mock lock.
+			other.TheExampleMethod2(true)
+			// Call back into the same mock on a different method too.
+			mockedService.TheExampleMethod2(false)
+			return []interface{}{4, nil}
+		})
+
+	ret := mockedService.MethodCalled("TheExampleMethod", 1, 2, 3)
+	assert.Equal(t, 4, ret[0])
+
+	other.AssertExpectations(t)
+	mockedService.AssertExpectations(t)
+}
+
+func Test_Mock_ReturnDynamic_ArgsCopy(t *testing.T) {
+	t.Parallel()
+
+	// make a test impl object
+	var mockedService = new(TestExampleImplementation)
+
+	var gotArgs Arguments
+
+	mockedService.Mock.
+		On("TheExampleMethod", 1, 2, 3).
+		ReturnDynamic(func(methodName string, callIndex int, args Arguments) []interface{} {
+			// Snapshot the copy before mutating it.
+			gotArgs = append(Arguments(nil), args...)
+			// Mutating the copy must not affect the mock's recorded call.
+			args[0] = 999
+			return []interface{}{1, nil}
+		})
+
+	mockedService.MethodCalled("TheExampleMethod", 1, 2, 3)
+
+	require.Equal(t, 3, len(gotArgs))
+	assert.Equal(t, 1, gotArgs[0])
+	assert.Equal(t, 2, gotArgs[1])
+	assert.Equal(t, 3, gotArgs[2])
+
+	require.Equal(t, 1, len(mockedService.Calls))
+	assert.Equal(t, 1, mockedService.Calls[0].Arguments[0])
+	assert.Equal(t, 2, mockedService.Calls[0].Arguments[1])
+	assert.Equal(t, 3, mockedService.Calls[0].Arguments[2])
+}
+
+func Test_Mock_ReturnDynamic_Failure(t *testing.T) {
+	t.Parallel()
+
+	// make a test impl object
+	var mockedService = new(TestExampleImplementation)
+	var mockT MockTestingT
+	mockedService.Test(&mockT)
+
+	mockedService.Mock.
+		On("TheExampleMethod", 1, 2, 3).
+		Return("static", nil).
+		ReturnDynamic(func(methodName string, callIndex int, args Arguments) []interface{} {
+			panic("dynamic return boom")
+		})
+
+	// The callback failure must follow the usual mock failure protocol
+	// (Errorf + FailNow) and never fall back to the static Return values.
+	assert.PanicsWithValue(t, mockTestingTFailNowCalled, func() {
+		mockedService.MethodCalled("TheExampleMethod", 1, 2, 3)
+	})
+
+	assert.Equal(t, 1, mockT.errorfCount)
+	assert.Equal(t, 1, mockT.failNowCount)
+}
+
+func Test_Mock_ReturnDynamic_PanicFirst(t *testing.T) {
+	t.Parallel()
+
+	// make a test impl object
+	var mockedService = new(TestExampleImplementation)
+	callbackRan := false
+
+	mockedService.Mock.
+		On("TheExampleMethod", 1, 2, 3).
+		Panic("panic before dynamic return").
+		ReturnDynamic(func(methodName string, callIndex int, args Arguments) []interface{} {
+			callbackRan = true
+			return []interface{}{4, nil}
+		})
+
+	assert.PanicsWithValue(t, "panic before dynamic return", func() {
+		mockedService.MethodCalled("TheExampleMethod", 1, 2, 3)
+	})
+	assert.False(t, callbackRan)
+}
+
+func ExampleCall_ReturnDynamic() {
+	var mockedService TestExampleImplementation
+
+	mockedService.Mock.
+		On("TheExampleMethod", 1, 2, 3).
+		ReturnDynamic(func(methodName string, callIndex int, args Arguments) []interface{} {
+			return []interface{}{fmt.Sprintf("%s-%d", methodName, callIndex)}
+		})
+
+	returnArgs := mockedService.Mock.MethodCalled("TheExampleMethod", 1, 2, 3)
+	fmt.Println(returnArgs[0])
+	// Output: TheExampleMethod-1
+}
+
 func Test_Mock_Return_NotBefore_In_Order(t *testing.T) {
 	t.Parallel()
 
