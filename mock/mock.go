@@ -32,6 +32,21 @@ type TestingT interface {
 	Call
 */
 
+// DynamicReturnFn computes the return arguments of a matched call at the
+// moment the call is answered, instead of relying on fixed values set with
+// [Call.Return].
+//
+// methodName is the stable name of the mocked method and callCount is the
+// 1-based sequence number of this invocation on the selected expectation.
+// args is an independent copy of the call arguments slice; the elements
+// themselves are shared, not deep-copied.
+//
+// The returned [Arguments] become the return values of the mocked call. If a
+// non-nil error is returned, the mock fails through its usual failure
+// protocol (see [Mock.Test]) and the static return arguments are not used as
+// a fallback.
+type DynamicReturnFn func(methodName string, callCount int, args Arguments) (Arguments, error)
+
 // Call represents a method call and is used for setting expectations,
 // as well as recording activity.
 type Call struct {
@@ -71,6 +86,11 @@ type Call struct {
 	// decoders.
 	RunFn func(Arguments)
 
+	// ReturnDynamicFn, when set, computes the return arguments of this call
+	// dynamically each time the call is answered. It takes precedence over
+	// ReturnArguments. See [Call.ReturnDynamic].
+	ReturnDynamicFn DynamicReturnFn
+
 	// PanicMsg holds msg to be used to mock panic on the function call
 	//  if the PanicMsg is set to a non nil string the function call will panic
 	// irrespective of other settings
@@ -90,6 +110,7 @@ func newCall(parent *Mock, methodName string, callerInfo []string, methodArgumen
 		Repeatability:   0,
 		WaitFor:         nil,
 		RunFn:           nil,
+		ReturnDynamicFn: nil,
 		PanicMsg:        nil,
 	}
 }
@@ -110,6 +131,36 @@ func (c *Call) Return(returnArguments ...interface{}) *Call {
 	defer c.unlock()
 
 	c.ReturnArguments = returnArguments
+
+	return c
+}
+
+// ReturnDynamic sets a callback that computes the return arguments each time
+// the expectation is matched, instead of returning the fixed values set with
+// [Call.Return].
+//
+//	Mock.On("Get", mock.Anything).ReturnDynamic(func(methodName string, callCount int, args mock.Arguments) (mock.Arguments, error) {
+//		return mock.Arguments{fmt.Sprintf("%s #%d", args.String(0), callCount)}, nil
+//	})
+//
+// The callback runs only after the selected call's Wait/After delay and Run
+// handler have completed, and it does not run at all when the call panics
+// (see [Call.Panic]). It receives the stable method name, the 1-based
+// sequence number of this invocation on the selected expectation, and an
+// independent copy of the call arguments slice (referenced elements are
+// shared, not deep-copied).
+//
+// The callback is invoked without the mock's internal lock held, so it may
+// safely re-enter the same [Mock] (e.g. call another mocked method).
+//
+// If the callback returns a non-nil error, the mock fails through its usual
+// failure protocol (see [Mock.Test]); the static return arguments are not
+// used as a fallback.
+func (c *Call) ReturnDynamic(fn DynamicReturnFn) *Call {
+	c.lock()
+	defer c.unlock()
+
+	c.ReturnDynamicFn = fn
 
 	return c
 }
@@ -552,6 +603,10 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 		call.Repeatability--
 	}
 	call.totalCalls++
+	// Capture the 1-based sequence number of this invocation now, while the
+	// lock is held, so that concurrent calls each keep their own number even
+	// if they complete out of order.
+	callCount := call.totalCalls
 
 	// add the call
 	m.Calls = append(m.Calls, *newCall(m, methodName, assert.CallerInfo(), arguments, call.ReturnArguments))
@@ -577,6 +632,30 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 
 	if runFn != nil {
 		runFn(arguments)
+	}
+
+	m.mutex.Lock()
+	returnDynamicFn := call.ReturnDynamicFn
+	m.mutex.Unlock()
+
+	if returnDynamicFn != nil {
+		// The callback runs without the internal lock held so that it may
+		// re-enter this Mock. Hand it an independent copy of the arguments
+		// slice; the referenced elements are shared, not deep-copied.
+		argsCopy := make(Arguments, len(arguments))
+		copy(argsCopy, arguments)
+
+		returnArgs, err := returnDynamicFn(call.Method, callCount, argsCopy)
+		if err != nil {
+			m.fail("\n\nmock: ReturnDynamic callback failed\n-----------------------------\n\n%s (call #%d)\n\nError: %s\nat: %s\n",
+				callString(call.Method, call.Arguments, true),
+				callCount,
+				err.Error(),
+				assert.CallerInfo(),
+			)
+			// unreachable when a test is set (FailNow) or not (panic)
+		}
+		return returnArgs
 	}
 
 	m.mutex.Lock()

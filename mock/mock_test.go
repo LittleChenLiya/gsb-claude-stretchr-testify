@@ -2550,3 +2550,195 @@ func TestIssue1227AssertExpectationsForObjectsWithMock(t *testing.T) {
 	AssertExpectationsForObjects(mockT, Mock{})
 	assert.Equal(t, 1, mockT.errorfCount)
 }
+
+func TestMock_ReturnDynamic(t *testing.T) {
+	m := &Mock{}
+	m.Test(t)
+
+	m.On("Get", Anything).ReturnDynamic(func(methodName string, callCount int, args Arguments) (Arguments, error) {
+		return Arguments{fmt.Sprintf("%s:%s:%d", methodName, args.String(0), callCount)}, nil
+	})
+
+	assert.Equal(t, "Get:a:1", m.MethodCalled("Get", "a").String(0))
+	assert.Equal(t, "Get:b:2", m.MethodCalled("Get", "b").String(0))
+	m.AssertExpectations(t)
+}
+
+func TestMock_ReturnDynamic_OutOfOrderCompletionKeepsSequenceNumbers(t *testing.T) {
+	m := &Mock{}
+
+	gate := make(chan time.Time)
+
+	var cbMu sync.Mutex
+	seqByArg := map[string]int{}
+	var completionOrder []int
+
+	m.On("Get", Anything).Times(2).WaitUntil(gate).ReturnDynamic(
+		func(methodName string, callCount int, args Arguments) (Arguments, error) {
+			cbMu.Lock()
+			seqByArg[args.String(0)] = callCount
+			cbMu.Unlock()
+
+			if callCount == 1 {
+				// Force the first selected call to complete after the second one.
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			cbMu.Lock()
+			completionOrder = append(completionOrder, callCount)
+			cbMu.Unlock()
+
+			return Arguments{fmt.Sprintf("%s#%d", args.String(0), callCount)}, nil
+		},
+	)
+
+	results := make([]string, 2)
+	var wg sync.WaitGroup
+	for i, arg := range []string{"a", "b"} {
+		wg.Add(1)
+		go func(i int, arg string) {
+			defer wg.Done()
+			results[i] = m.MethodCalled("Get", arg).String(0)
+		}(i, arg)
+	}
+
+	// Wait until both calls have been selected (and thus numbered) and are
+	// blocked on the gate.
+	require.Eventually(t, func() bool {
+		m.mutex.Lock()
+		defer m.mutex.Unlock()
+		return len(m.Calls) == 2
+	}, 5*time.Second, time.Millisecond)
+
+	close(gate)
+	wg.Wait()
+
+	cbMu.Lock()
+	defer cbMu.Unlock()
+
+	// The two calls completed in reverse order of their sequence numbers...
+	require.Equal(t, []int{2, 1}, completionOrder)
+
+	// ...but each return value was computed with its own sequence number.
+	assert.ElementsMatch(t, []int{1, 2}, []int{seqByArg["a"], seqByArg["b"]})
+	for i, arg := range []string{"a", "b"} {
+		assert.Equal(t, fmt.Sprintf("%s#%d", arg, seqByArg[arg]), results[i])
+	}
+}
+
+func TestMock_ReturnDynamic_CallbackMayReenterMock(t *testing.T) {
+	m := &Mock{}
+	m.Test(t)
+
+	m.On("Inner").Return("inner")
+	m.On("Outer").ReturnDynamic(func(methodName string, callCount int, args Arguments) (Arguments, error) {
+		// Re-entering the same mock must not deadlock, because the callback
+		// runs without the mock's internal lock held.
+		inner := m.MethodCalled("Inner").String(0)
+		return Arguments{inner + "+outer"}, nil
+	})
+
+	assert.Equal(t, "inner+outer", m.MethodCalled("Outer").String(0))
+	m.AssertExpectations(t)
+}
+
+func TestMock_ReturnDynamic_FailureUsesMockFailProtocol(t *testing.T) {
+	t.Run("with test", func(t *testing.T) {
+		m := &Mock{}
+		mockT := &MockTestingT{}
+		m.Test(mockT)
+
+		m.On("Get").Return("stale-static-value").ReturnDynamic(
+			func(methodName string, callCount int, args Arguments) (Arguments, error) {
+				return nil, errors.New("cannot compute return")
+			},
+		)
+
+		// The failure goes through the mock failure protocol (Errorf +
+		// FailNow) instead of falling back to the static return arguments.
+		assert.PanicsWithValue(t, mockTestingTFailNowCalled, func() {
+			m.MethodCalled("Get")
+		})
+		assert.Equal(t, 1, mockT.errorfCount)
+		assert.Equal(t, 1, mockT.failNowCount)
+	})
+
+	t.Run("without test", func(t *testing.T) {
+		m := &Mock{}
+		m.On("Get").Return("stale-static-value").ReturnDynamic(
+			func(methodName string, callCount int, args Arguments) (Arguments, error) {
+				return nil, errors.New("cannot compute return")
+			},
+		)
+
+		assert.Panics(t, func() {
+			m.MethodCalled("Get")
+		})
+	})
+}
+
+func TestMock_ReturnDynamic_PanicSkipsCallback(t *testing.T) {
+	m := &Mock{}
+
+	callbackRan := false
+	m.On("Get").Panic("boom").ReturnDynamic(
+		func(methodName string, callCount int, args Arguments) (Arguments, error) {
+			callbackRan = true
+			return Arguments{"unreachable"}, nil
+		},
+	)
+
+	assert.PanicsWithValue(t, "boom", func() {
+		m.MethodCalled("Get")
+	})
+	assert.False(t, callbackRan, "ReturnDynamic callback must not run when the call panics")
+}
+
+func TestMock_ReturnDynamic_RunsAfterWaitAndRun(t *testing.T) {
+	m := &Mock{}
+	m.Test(t)
+
+	var events []string
+	m.On("Get").
+		After(10 * time.Millisecond).
+		Run(func(args Arguments) { events = append(events, "run") }).
+		ReturnDynamic(func(methodName string, callCount int, args Arguments) (Arguments, error) {
+			events = append(events, "dynamic")
+			return Arguments{"ok"}, nil
+		})
+
+	assert.Equal(t, "ok", m.MethodCalled("Get").String(0))
+	assert.Equal(t, []string{"run", "dynamic"}, events)
+}
+
+func TestMock_ReturnDynamic_ArgumentsCopyIsIndependent(t *testing.T) {
+	m := &Mock{}
+	m.Test(t)
+
+	m.On("Set", Anything, Anything).ReturnDynamic(
+		func(methodName string, callCount int, args Arguments) (Arguments, error) {
+			// Mutating the copy handed to the callback must not corrupt the
+			// recorded call.
+			args[0] = "mutated"
+			return Arguments{}, nil
+		},
+	)
+
+	m.MethodCalled("Set", "x", "y")
+	m.AssertCalled(t, "Set", "x", "y")
+}
+
+func ExampleCall_ReturnDynamic() {
+	m := &Mock{}
+
+	m.On("Get", Anything).ReturnDynamic(func(methodName string, callCount int, args Arguments) (Arguments, error) {
+		return Arguments{fmt.Sprintf("%s(%s) call #%d", methodName, args.String(0), callCount)}, nil
+	})
+
+	fmt.Println(m.MethodCalled("Get", "foo").String(0))
+	fmt.Println(m.MethodCalled("Get", "bar").String(0))
+
+	// Output:
+	// Get(foo) call #1
+	// Get(bar) call #2
+}
