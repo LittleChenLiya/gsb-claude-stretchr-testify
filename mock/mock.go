@@ -313,6 +313,15 @@ type Mock struct {
 	// this data completely allowing you to do whatever you like with it.
 	testData objx.Map
 
+	// observers receives lifecycle events for actual invocations.
+	observers []invocationObserverEntry
+
+	// observerFailures holds values recovered from panicking observers.
+	observerFailures []interface{}
+
+	// nextInvocationID is the ID assigned to the next entering invocation.
+	nextInvocationID uint64
+
 	mutex sync.Mutex
 }
 
@@ -496,6 +505,11 @@ func (m *Mock) Called(arguments ...interface{}) Arguments {
 // by appropriate [Mock.On] calls)
 // If Call.WaitFor is set, blocks until the channel is closed or receives a message.
 func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Arguments {
+	// Assign the invocation an explicit ID and notify observers before any
+	// matching happens. The ID travels with every event of this invocation so
+	// concurrent invocations can be correlated without relying on ordering.
+	ctx := m.beginInvocation(methodName, arguments)
+
 	m.mutex.Lock()
 	// TODO: could combine expected and closes in single loop
 	found, call := m.findExpectedCall(methodName, arguments...)
@@ -504,6 +518,7 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 		// expected call found, but it has already been called with repeatable times
 		if call != nil {
 			m.mutex.Unlock()
+			ctx.unmatched()
 			m.fail("\nassert: mock: The method has been called over %d times.\n\tEither do one more Mock.On(%#v).Return(...), or remove extra call.\n\tThis call was unexpected:\n\t\t%s\n\tat: %s", call.totalCalls, methodName, callString(methodName, arguments, true), assert.CallerInfo())
 		}
 		// we have to fail here - because we don't know what to do
@@ -513,6 +528,10 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 		//   b) the arguments are not what was expected
 		closestCall, mismatch := m.findClosestCall(methodName, arguments...)
 		m.mutex.Unlock()
+
+		// No expectation could actually be selected for this invocation;
+		// report the terminal observer event without re-running any matcher.
+		ctx.unmatched()
 
 		if closestCall != nil {
 			m.fail("\n\nmock: Unexpected Method Call\n-----------------------------\n\n%s\n\nThe closest call I have is: \n\n%s\n\n%s\nDiff: %s\nat: %s\n",
@@ -527,23 +546,29 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 		}
 	}
 
+	var unsatisfiedRequirement *Call
 	for _, requirement := range call.requires {
 		if satisfied, _ := requirement.Parent.checkExpectation(requirement); !satisfied {
-			m.mutex.Unlock()
-			m.fail("mock: Unexpected Method Call\n-----------------------------\n\n%s\n\nMust not be called before%s:\n\n%s",
-				callString(call.Method, call.Arguments, true),
-				func() (s string) {
-					if requirement.totalCalls > 0 {
-						s = " another call of"
-					}
-					if call.Parent != requirement.Parent {
-						s += " method from another mock instance"
-					}
-					return
-				}(),
-				callString(requirement.Method, requirement.Arguments, true),
-			)
+			unsatisfiedRequirement = requirement
+			break
 		}
+	}
+	if unsatisfiedRequirement != nil {
+		m.mutex.Unlock()
+		ctx.unmatched()
+		m.fail("mock: Unexpected Method Call\n-----------------------------\n\n%s\n\nMust not be called before%s:\n\n%s",
+			callString(call.Method, call.Arguments, true),
+			func() (s string) {
+				if unsatisfiedRequirement.totalCalls > 0 {
+					s = " another call of"
+				}
+				if call.Parent != unsatisfiedRequirement.Parent {
+					s += " method from another mock instance"
+				}
+				return
+			}(),
+			callString(unsatisfiedRequirement.Method, unsatisfiedRequirement.Arguments, true),
+		)
 	}
 
 	if call.Repeatability == 1 {
@@ -557,6 +582,10 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 	m.Calls = append(m.Calls, *newCall(m, methodName, assert.CallerInfo(), arguments, call.ReturnArguments))
 	m.mutex.Unlock()
 
+	// The actual expectation has been selected; announce the match before
+	// blocking, panicking or returning. Observers never re-run matching here.
+	ctx.matched(call)
+
 	// block if specified
 	if call.WaitFor != nil {
 		<-call.WaitFor
@@ -568,6 +597,8 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 	panicMsg := call.PanicMsg
 	m.mutex.Unlock()
 	if panicMsg != nil {
+		// Report at the panic stage, then re-raise so the caller sees it.
+		ctx.panicked(*panicMsg)
 		panic(*panicMsg)
 	}
 
@@ -582,6 +613,8 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 	m.mutex.Lock()
 	returnArgs := call.ReturnArguments
 	m.mutex.Unlock()
+
+	ctx.returned(returnArgs)
 
 	return returnArgs
 }
