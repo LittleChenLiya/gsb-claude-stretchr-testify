@@ -313,6 +313,20 @@ type Mock struct {
 	// this data completely allowing you to do whatever you like with it.
 	testData objx.Map
 
+	// observer receives events for mocked calls, or nil to disable observation.
+	observer CallObserver
+
+	// observerErrors collects errors and panics reported by the observer. They
+	// never affect the mocked call.
+	observerErrors []error
+
+	// observeMethods restricts which methods are observed. nil means every
+	// method is observed.
+	observeMethods map[string]struct{}
+
+	// callCounter is the source of unique call identifiers.
+	callCounter uint64
+
 	mutex sync.Mutex
 }
 
@@ -498,9 +512,13 @@ func (m *Mock) Called(arguments ...interface{}) Arguments {
 func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Arguments {
 	m.mutex.Lock()
 	// TODO: could combine expected and closes in single loop
+	callID := m.nextCallID()
+	m.observe(CallEvent{ID: callID, Phase: CallEventEntry, Method: methodName, ParamTypes: typesOf(arguments)})
+
 	found, call := m.findExpectedCall(methodName, arguments...)
 
 	if found < 0 {
+		m.observe(CallEvent{ID: callID, Phase: CallEventMatch, Method: methodName, Matched: false})
 		// expected call found, but it has already been called with repeatable times
 		if call != nil {
 			m.mutex.Unlock()
@@ -526,6 +544,8 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 			m.fail("\nassert: mock: I don't know what to return because the method call was unexpected.\n\tEither do Mock.On(%#v).Return(...) first, or remove the %s() call.\n\tThis method was unexpected:\n\t\t%s\n\tat: %s", methodName, methodName, callString(methodName, arguments, true), assert.CallerInfo())
 		}
 	}
+
+	m.observe(CallEvent{ID: callID, Phase: CallEventMatch, Method: methodName, Call: call, Matched: true})
 
 	for _, requirement := range call.requires {
 		if satisfied, _ := requirement.Parent.checkExpectation(requirement); !satisfied {
@@ -568,6 +588,9 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 	panicMsg := call.PanicMsg
 	m.mutex.Unlock()
 	if panicMsg != nil {
+		m.mutex.Lock()
+		m.observe(CallEvent{ID: callID, Phase: CallEventPanic, Method: methodName, PanicValue: *panicMsg})
+		m.mutex.Unlock()
 		panic(*panicMsg)
 	}
 
@@ -581,6 +604,7 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 
 	m.mutex.Lock()
 	returnArgs := call.ReturnArguments
+	m.observe(CallEvent{ID: callID, Phase: CallEventReturn, Method: methodName, ReturnTypes: typesOf(returnArgs)})
 	m.mutex.Unlock()
 
 	return returnArgs
